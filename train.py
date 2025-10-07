@@ -113,7 +113,6 @@ def train():
         remove_columns=dataset.column_names,
         batched=True,
         batch_size=32,
-        num_proc=8,
         desc="Processing audio and phonemes"
     )
     
