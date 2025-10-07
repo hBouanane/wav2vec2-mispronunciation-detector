@@ -39,7 +39,9 @@ def evaluate_model():
     
     # Get validation split
     dataset = dataset.shuffle(seed=42)
-    val_dataset = dataset.select(range(config.train_size, config.train_size + config.val_size))
+    if config.total_samples is None:
+        config.train_size = int(0.8 * len(dataset))
+    val_dataset = dataset.select(range(config.train_size, len(dataset)))
     
     print(f"Validation dataset size: {len(val_dataset)}")
     

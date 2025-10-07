@@ -101,6 +101,10 @@ Place your `sws_arabic.txt` vocabulary file in the project root. This file shoul
 ### Training
 
 ```bash
+# Login to wandb
+wandb login
+
+# Run training
 python train.py
 ```
 
@@ -188,10 +192,10 @@ Training on 2000 samples, validating on 1000 samples:
 
 | Epoch | Train Loss |
 | ----- | ---------- |
-| 1     | 0.0971     |
-| 2     | 0.0871     |
-| 3     | 0.0878     |
-| 4     | 0.0786     |
+| 16    | 0.0971     |
+| 17    | 0.0871     |
+| 18    | 0.0878     |
+| 19    | 0.0786     |
 
 Validation WER will be available after running `evaluate.py`.
 
