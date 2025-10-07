@@ -34,9 +34,6 @@ def evaluate_model():
         desc="Processing audio and phonemes"
     )
     
-    # Filter out empty batches
-    dataset = dataset.filter(lambda x: len(x["input_values"]) > 0)
-    
     # Get validation split
     dataset = dataset.shuffle(seed=42)
     if config.total_samples is None:

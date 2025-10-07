@@ -9,7 +9,7 @@ def load_and_prepare_dataset(config):
     """Load dataset from HuggingFace and prepare it."""
     print("Loading dataset...")
     
-    if config.total_samples:
+    if not config.total_samples:
         dataset_with_reference_phoneme = load_dataset(
             config.dataset_with_reference_name,
             split="train"

@@ -113,11 +113,9 @@ def train():
         remove_columns=dataset.column_names,
         batched=True,
         batch_size=32,
+        num_proc=8,
         desc="Processing audio and phonemes"
     )
-    
-    # Filter out empty batches
-    dataset = dataset.filter(lambda x: len(x["input_values"]) > 0)
     
     dataset = dataset.shuffle(seed=42)
     if config.total_samples is None:
@@ -237,7 +235,7 @@ def train():
             )
             
             # Compute CTC loss
-            loss = model.module.ctc_loss(log_probs, targets, input_lengths, target_lengths)
+            loss = model.ctc_loss(log_probs, targets, input_lengths, target_lengths)
             
             # Backward pass
             accelerator.backward(loss)
