@@ -48,8 +48,8 @@ class Config:
     save_path: str = "./Wav2Vec2_mispronunciation_detector"
     
     # Data size
-    total_samples: int = 10
-    train_size: int = 6
+    total_samples: int = None
+    train_size: int = None
     
     def to_dict(self):
         return asdict(self)
