@@ -263,8 +263,6 @@ def train():
                 if config.use_wandb:
                     wandb.log(log_dict, step=global_step)
                 
-                print(f"\nStep {global_step}: Loss={loss.item():.4f}, Avg Loss={avg_loss:.4f}, LR={lr_scheduler.get_last_lr()[0]:.2e}")
-            
             # Evaluation by steps
             if config.eval_strategy == "steps" and global_step % config.eval_steps == 0:
                 print(f"\n{'='*50}")
