@@ -92,10 +92,6 @@ This project uses the **IqraEval** dataset:
 * `IqraEval/Iqra_TTS`: Text-to-speech samples with reference phonemes
 * Contains Arabic speech with phoneme-level annotations
 
-### Required Files
-
-Place your `sws_arabic.txt` vocabulary file in the project root. This file should contain one phoneme per line.
-
 ## Usage
 
 ### Training
