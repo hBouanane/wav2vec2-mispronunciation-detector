@@ -1,0 +1,205 @@
+"""Train the reference-anchored MDD model (v2) on 2025 IqraEval data only.
+
+Single GPU:   python v2/train_v2.py --out /kaggle/working/run1 --mdd-eval interspeech_IqraEval/mdd_eval
+Two GPUs:     accelerate launch --multi_gpu --num_processes 2 v2/train_v2.py ...
+Resume:       add --resume (continues from <out>/last/)
+Local smoke:  python v2/train_v2.py --smoke --out runs/smoke --mdd-eval ../interspeech_IqraEval/mdd_eval
+"""
+import argparse
+import json
+import math
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+from accelerate import Accelerator
+from datasets.distributed import split_dataset_by_node
+from torch.utils.data import DataLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data_v2 import (Collator, Featurizer, PhoneVocab, RefCorrupter, build_train_stream,  # noqa: E402
+                     build_val_sets)
+from mdd_metric import official_mdd  # noqa: E402
+from model_v2 import RefAnchoredMDD, decode  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TAUS = [0.3, 0.5, 0.7, 0.85, 0.95]
+
+
+def get_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--mdd-eval", required=True, help="path to interspeech_IqraEval/mdd_eval")
+    ap.add_argument("--encoder", default="elgeish/wav2vec2-large-xlsr-53-arabic")
+    ap.add_argument("--vocab", default=os.path.join(HERE, "..", "sws_arabic.txt"))
+    ap.add_argument("--confusions", default=os.path.join(HERE, "confusions.json"))
+    ap.add_argument("--max-steps", type=int, default=30000)
+    ap.add_argument("--batch-size", type=int, default=6)
+    ap.add_argument("--grad-accum", type=int, default=2)
+    ap.add_argument("--lr-encoder", type=float, default=3e-5)
+    ap.add_argument("--lr-head", type=float, default=3e-4)
+    ap.add_argument("--warmup", type=int, default=1500)
+    ap.add_argument("--freeze-encoder-steps", type=int, default=1000,
+                    help="train only the new layers first so random heads don't wreck the encoder")
+    ap.add_argument("--eval-every", type=int, default=2000)
+    ap.add_argument("--save-every", type=int, default=1000)
+    ap.add_argument("--p-native", type=float, default=0.55, help="share of native Iqra_train in the mix")
+    ap.add_argument("--corrupt-p", type=float, default=0.5, help="P(corrupt reference) for native audio")
+    ap.add_argument("--max-seconds", type=float, default=15.0)
+    ap.add_argument("--n-val", type=int, default=1500, help="validation utterances per subset")
+    ap.add_argument("--num-workers", type=int, default=3)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--time-limit-h", type=float, default=11.3, help="save and stop before the Kaggle 12 h limit")
+    ap.add_argument("--smoke", action="store_true", help="tiny random encoder, a few steps, CPU/GPU sanity check")
+    return ap.parse_args()
+
+
+class StreamCollate:
+    def __init__(self, collate):
+        self.collate = collate
+
+    def __call__(self, xs):
+        return self.collate([x["f"] for x in xs])
+
+
+def evaluate(model, val, vocab, collate, acc, args, step):
+    model.eval()
+    feat = Featurizer(vocab, None, max_seconds=60)
+    items = [(x, feat.from_lists(x["audio"], x["ref"], x["spoken"])) for x in val]
+    items = [(x, f) for x, f in items if f is not None]
+    items.sort(key=lambda t: len(t[1]["wave"]))
+    probs = []  # keep logits once, decode with several thresholds
+    with torch.no_grad():
+        for i in range(0, len(items), 8):
+            chunk = items[i:i + 8]
+            b = collate([f for _, f in chunk])
+            b = {k: v.to(acc.device) for k, v in b.items()}
+            with acc.autocast():
+                out = model(b["wave"], b["wave_mask"], b["ref"])
+            probs.append(({"slot_logits": out["slot_logits"].float().cpu(), "ins_logits": out["ins_logits"].float().cpu()},
+                          b["ref"].cpu(), chunk))
+    results = {}
+    for tau in TAUS:
+        ids, refs, anns, preds = [], [], [], []
+        for out, ref, chunk in probs:
+            for (x, _), p in zip(chunk, decode(out, ref, vocab, tau=tau, tau_ins=0.5)):
+                ids.append(x["id"]); refs.append(x["ref"]); anns.append(x["spoken"]); preds.append(p)
+        results[tau] = official_mdd(ids, refs, anns, preds, args.mdd_eval,
+                                    workdir=os.path.join(args.out, "val_tmp"))
+    model.train()
+    best_tau = max(results, key=lambda t: results[t].get("f1", 0))
+    return best_tau, results
+
+
+def main():
+    args = get_args()
+    if args.smoke:
+        args.encoder = "hf-internal-testing/tiny-random-wav2vec2"
+        args.max_steps, args.eval_every, args.save_every = 6, 6, 3
+        args.batch_size, args.grad_accum, args.n_val, args.warmup = 2, 1, 6, 2
+        args.freeze_encoder_steps, args.num_workers = 2, 0
+    acc = Accelerator(mixed_precision="fp16" if torch.cuda.is_available() else "no",
+                      gradient_accumulation_steps=args.grad_accum)
+    os.makedirs(args.out, exist_ok=True)
+    torch.manual_seed(args.seed)
+
+    vocab = PhoneVocab(args.vocab)
+    corrupter = RefCorrupter(args.confusions)
+    model = RefAnchoredMDD(vocab, encoder_name=args.encoder, d_model=64 if args.smoke else 512,
+                           n_layers=1 if args.smoke else 4, n_heads=2 if args.smoke else 8,
+                           grad_checkpointing=not args.smoke)
+
+    enc_params = [p for n, p in model.named_parameters() if n.startswith("encoder.") and p.requires_grad]
+    head_params = [p for n, p in model.named_parameters() if not n.startswith("encoder.")]
+    opt = torch.optim.AdamW([{"params": enc_params, "lr": args.lr_encoder},
+                             {"params": head_params, "lr": args.lr_head}], weight_decay=0.01)
+
+    def head_lr(s):
+        if s < args.warmup:
+            return s / max(1, args.warmup)
+        return 0.5 * (1 + math.cos(math.pi * min(1.0, (s - args.warmup) / max(1, args.max_steps - args.warmup))))
+
+    def enc_lr(s):  # encoder stays frozen (lr 0) first, then its own warm-up
+        f = args.freeze_encoder_steps
+        return 0.0 if s < f else head_lr(s - f) if s - f < args.warmup else head_lr(s)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, [enc_lr, head_lr])  # stepped manually per optimizer step
+
+    state = {"step": 0, "best_f1": -1.0, "best_tau": 0.5}
+    last_dir = os.path.join(args.out, "last")
+    model, opt = acc.prepare(model, opt)
+    if args.resume and os.path.isdir(last_dir):
+        acc.load_state(last_dir)
+        state = json.load(open(os.path.join(last_dir, "train_state.json")))
+        for _ in range(state["step"]):
+            sched.step()
+        acc.print(f"resumed at step {state['step']}")
+
+    # streaming data; reseed on resume so we don't replay the same order
+    stream = build_train_stream(seed=args.seed + state["step"], p_native=args.p_native)
+    stream = split_dataset_by_node(stream, rank=acc.process_index, world_size=acc.num_processes)
+    feat = Featurizer(vocab, corrupter, corrupt_p=args.corrupt_p, max_seconds=args.max_seconds,
+                      seed=args.seed + state["step"] + 1000 * acc.process_index)
+    stream = stream.map(lambda ex: {"f": feat(ex)}, remove_columns=["audio", "ref", "spoken", "native"])
+    collate = Collator(vocab)
+    loader = DataLoader(stream, batch_size=args.batch_size, num_workers=args.num_workers,
+                        collate_fn=StreamCollate(collate))
+
+    val = build_val_sets(corrupter, n_native=args.n_val, n_tts=args.n_val) if acc.is_main_process else None
+    acc.print(f"validation utterances: {len(val) if val else 0}")
+
+    t0, log = time.time(), []
+    model.train()
+    unwrapped = acc.unwrap_model(model)
+    for batch in loader:
+        if state["step"] >= args.max_steps or (time.time() - t0) / 3600 > args.time_limit_h:
+            break
+        if batch is None:
+            continue
+        batch = {k: v.to(acc.device, non_blocking=True) for k, v in batch.items()}
+        frozen = state["step"] < args.freeze_encoder_steps
+        with acc.accumulate(model):
+            out = model(batch["wave"], batch["wave_mask"], batch["ref"], batch["slot"], batch["ins"], batch["ctc"])
+            acc.backward(out["loss"])
+            if acc.sync_gradients:
+                acc.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); opt.zero_grad()
+        if not acc.sync_gradients:
+            continue
+        sched.step()
+        state["step"] += 1
+        s = state["step"]
+        log.append([out["loss"].item(), out["l_slot"].item(), out["l_ins"].item(), out["l_ctc"].item()])
+        if s % 50 == 0:
+            m = np.mean(log, 0); log = []
+            acc.print(f"step {s} loss {m[0]:.4f} slot {m[1]:.4f} ins {m[2]:.4f} ctc {m[3]:.4f} "
+                      f"lr {sched.get_last_lr()[1]:.2e}/{sched.get_last_lr()[0]:.2e} {'(encoder frozen)' if frozen else ''} "
+                      f"{(time.time() - t0) / 60:.1f} min", flush=True)
+        if s % args.save_every == 0:
+            acc.save_state(last_dir)
+            if acc.is_main_process:
+                json.dump(state, open(os.path.join(last_dir, "train_state.json"), "w"))
+        if s % args.eval_every == 0 and acc.is_main_process:
+            tau, res = evaluate(unwrapped, val, vocab, collate, acc, args, s)
+            f1 = res[tau].get("f1", 0)
+            acc.print(f"[eval step {s}] " + " | ".join(f"tau {t}: F1 {r.get('f1', 0):.4f} P {r.get('precision', 0):.3f} "
+                                                       f"R {r.get('recall', 0):.3f}" for t, r in res.items()), flush=True)
+            with open(os.path.join(args.out, "eval_log.jsonl"), "a") as f:
+                f.write(json.dumps({"step": s, "results": {str(k): v for k, v in res.items()}}) + "\n")
+            if f1 > state["best_f1"]:
+                state.update(best_f1=f1, best_tau=tau)
+                torch.save(unwrapped.state_dict(), os.path.join(args.out, "best_model.pt"))
+                json.dump({**state, "args": vars(args)}, open(os.path.join(args.out, "best.json"), "w"), indent=1)
+                acc.print(f"  new best F1 {f1:.4f} at tau {tau}")
+        acc.wait_for_everyone()
+
+    acc.save_state(last_dir)
+    if acc.is_main_process:
+        json.dump(state, open(os.path.join(last_dir, "train_state.json"), "w"))
+    acc.print(f"stopped at step {state['step']} best val F1 {state['best_f1']:.4f} (tau {state['best_tau']})")
+
+
+if __name__ == "__main__":
+    main()
