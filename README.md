@@ -1,5 +1,11 @@
 # Wav2Vec2 Arabic Mispronunciation Detector
 
+> **Work in progress on this branch (`ctc`):** a plain CTC phoneme recogniser (audio only, no
+> reference input) trained on all released 2025 data — see `train.py`, `kaggle_train.ipynb`.
+> The model and results described below are **v1**; its code is at git tag
+> [`v1`](https://github.com/hBouanane/wav2vec2-mispronunciation-detector/tree/v1).
+> The reference-anchored experiment (test F1 0.27) is kept on branch `v2`.
+
 A reference-conditioned phoneme recogniser for **Modern Standard Arabic (MSA) mispronunciation detection and diagnosis (MDD)**, built for the [IqraEval](https://huggingface.co/IqraEval) shared task.
 
 The model listens to a learner reading a fully-vowelised sentence and outputs the phoneme sequence that was actually spoken. Comparing it with the canonical (reference) phonemes shows where the reader substituted, deleted or inserted a sound.

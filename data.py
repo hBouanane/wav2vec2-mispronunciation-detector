@@ -1,130 +1,169 @@
-from dataclasses import dataclass
-from typing import List, Dict, Union
+"""Training / dev data read directly from the released parquet files (no streaming, no
+datasets cache, no modification of references or labels).
+
+  Iqra_train (native)  target = phoneme_ref (== phoneme_aug: native speakers read correctly)
+  Iqra_TTS             target = phoneme_mis (what the TTS voice actually says), reference
+                       = phoneme_ref (kept only for the optional reference penalty and dev MDD)
+
+Shuffling: each epoch the list of all row groups (~100 rows each, from every file) is
+shuffled, split across GPUs and data workers, and each worker mixes `shuffle_pool` row
+groups at a time, so a batch mixes random files, speakers and both datasets.
+"""
+import glob
+import io
+import math
+import zlib
+
+import numpy as np
+import pyarrow.parquet as pq
+import soundfile as sf
 import torch
-from datasets import load_dataset, Dataset, Audio
-from transformers import Wav2Vec2Processor
+from scipy.signal import resample_poly
+from torch.utils.data import IterableDataset, get_worker_info
+
+SR = 16000
+COLUMNS = {"native": ("audio", "phoneme_ref", "phoneme_ref"),   # audio, reference, target
+           "tts": ("audio", "phoneme_ref", "phoneme_mis")}
 
 
-def load_and_prepare_dataset(config):
-    """Load dataset from HuggingFace and prepare it."""
-    print("Loading dataset...")
-    
-    if not config.total_samples:
-        dataset_with_reference_phoneme = load_dataset(
-            config.dataset_with_reference_name,
-            split="train"
-        )
-    else:
-        # Streaming dataset
-        dataset_with_reference_phoneme = load_dataset(
-            config.dataset_with_reference_name,
-            split="train",
-            streaming=True
-        )
-        
-        # Shuffle with a buffer
-        dataset_with_reference_phoneme = dataset_with_reference_phoneme.shuffle(buffer_size=10_000, seed=42)
-        
-        # Take samples
-        dataset_with_reference_phoneme = Dataset.from_generator(
-            dataset_with_reference_phoneme.take(config.total_samples).__iter__
-        )
-    
-    # Cast audio
-    dataset_with_reference_phoneme = dataset_with_reference_phoneme.cast_column(
-        "audio", Audio(sampling_rate=config.sampling_rate)
-    )
-    
-    return dataset_with_reference_phoneme
+def expand(pattern):
+    files = sorted(glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"no parquet files match {pattern}")
+    return files
 
 
-def prepare_dataset(batch, processor, config):
-    """
-    Batch process dataset with error handling and validation.
-    """
-    # Extract audio arrays
-    audio_arrays = [audio["array"] for audio in batch["audio"]]
-
-    # Clean phoneme sequences with validation
-    phoneme_aug_cleaned = []
-    phoneme_ref_cleaned = []
-    valid_indices = []
-
-    for idx, (aug, ref) in enumerate(zip(batch['phoneme_aug'], batch['phoneme_ref'])):
-        aug_clean = aug.replace('<sil>', '').strip()
-        ref_clean = ref.replace('<sil>', '').strip()
-
-        # Only keep examples with valid phonemes
-        if aug_clean and ref_clean:
-            phoneme_aug_cleaned.append(aug_clean)
-            phoneme_ref_cleaned.append(ref_clean)
-            valid_indices.append(idx)
-
-    # Filter audio arrays to match valid phonemes
-    audio_arrays = [audio_arrays[idx] for idx in valid_indices]
-
-    # Handle empty batch
-    if not audio_arrays:
-        return {
-            "input_values": [],
-            "labels": [],
-            "phoneme_ref_ids": []
-        }
-
-    # Batch process audio
-    processed_audio = processor(
-        audio_arrays,
-        sampling_rate=config.sampling_rate,
-        return_tensors="np"
-    )
-
-    # Batch process phonemes
-    with processor.as_target_processor():
-        labels_batch = processor(phoneme_aug_cleaned)
-        phoneme_ref_batch = processor(phoneme_ref_cleaned)
-
-    return {
-        "input_values": processed_audio.input_values,
-        "labels": labels_batch.input_ids,
-        "phoneme_ref_ids": phoneme_ref_batch.input_ids
-    }
+def decode_audio(audio):
+    wave, sr = sf.read(io.BytesIO(audio["bytes"]), dtype="float32", always_2d=False)
+    if wave.ndim > 1:
+        wave = wave.mean(1)
+    if sr != SR:
+        g = math.gcd(sr, SR)
+        wave = resample_poly(wave, SR // g, sr // g).astype(np.float32)
+    return wave
 
 
-@dataclass
-class DataCollatorCTCWithReference:
-    processor: Wav2Vec2Processor
-    padding: Union[bool, str] = True
+def is_tts_dev(path, rg, every):
+    """Deterministic hold-out of whole TTS row groups (stable across machines and runs)."""
+    name = path.replace("\\", "/").split("/")[-1]
+    return zlib.crc32(f"{name}:{rg}".encode()) % every == 0
 
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # Separate features
-        input_features = [{"input_values": f["input_values"]} for f in features]
-        label_features = [{"input_ids": f["labels"]} for f in features]
-        phoneme_ref_features = [{"input_ids": f["phoneme_ref_ids"]} for f in features]
 
-        # Pad input audio
-        batch = self.processor.pad(
-            input_features,
-            padding=self.padding,
-            return_tensors="pt"
-        )
+def row_groups(files, kind, keep):
+    units = []
+    for f in files:
+        for rg in range(pq.ParquetFile(f).metadata.num_row_groups):
+            if keep(f, rg):
+                units.append((f, rg, kind))
+    return units
 
-        # Pad labels
-        with self.processor.as_target_processor():
-            labels_batch = self.processor.pad(
-                label_features,
-                padding=self.padding,
-                return_tensors="pt"
-            )
-            phoneme_ref_batch = self.processor.pad(
-                phoneme_ref_features,
-                padding=self.padding,
-                return_tensors="pt"
-            )
 
-        # Replace padding tokens in labels with -100 for CTC loss
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+def augment(wave, cfg, rng):
+    if rng.random() < cfg.speed_p:
+        factor = 1.0 + rng.uniform(-cfg.speed_range, cfg.speed_range)
+        up, down = 100, int(round(100 * factor))            # factor > 1 -> faster -> shorter
+        wave = resample_poly(wave, up, down).astype(np.float32)
+    if rng.random() < cfg.noise_p:
+        snr = rng.uniform(*cfg.noise_snr_db)
+        power = float(np.mean(wave ** 2)) + 1e-10
+        wave = wave + rng.standard_normal(len(wave)).astype(np.float32) * math.sqrt(power / 10 ** (snr / 10))
+    return wave
 
-        batch["labels"] = labels
-        batch["phoneme_ref_ids"] = phoneme_ref_batch["input_ids"]
 
-        return batch
+class RowGroupShuffle(IterableDataset):
+    """Infinite iterator over training examples (each rank and worker gets its own share of
+    every epoch; training stops by step count, so ranks never run out at different times)."""
+
+    def __init__(self, units, vocab, cfg, rank=0, world=1, seed=0, train=True):
+        self.units, self.vocab, self.cfg = units, vocab, cfg
+        self.rank, self.world, self.seed, self.train = rank, world, seed, train
+
+    def __iter__(self):
+        info = get_worker_info()
+        wid, nw = (info.id, info.num_workers) if info else (0, 1)
+        rng = np.random.default_rng([self.seed, self.rank, wid])
+        handles = {}
+        epoch = 0
+        while True:
+            order = np.random.default_rng([self.seed, epoch]).permutation(len(self.units))
+            mine = order[self.rank::self.world][wid::nw]
+            for start in range(0, len(mine), self.cfg.shuffle_pool):
+                pool = []
+                for u in mine[start:start + self.cfg.shuffle_pool]:
+                    path, rg, kind = self.units[u]
+                    if path not in handles:
+                        handles[path] = pq.ParquetFile(path)
+                    a, r, t = COLUMNS[kind]
+                    tab = handles[path].read_row_group(rg, columns=list(dict.fromkeys([a, r, t])))
+                    name = path.replace("\\", "/").split("/")[-1]
+                    for row in tab.to_pylist():
+                        pool.append((row[a], row[r], row[t], f"{kind}:{name}:{rg}"))
+                rng.shuffle(pool)
+                for audio, ref, tgt, src in pool:
+                    ex = self.featurize(audio, ref, tgt, rng)
+                    if ex is not None:
+                        ex["src"] = src  # dataset:file:row_group, for diagnostics only
+                        yield ex
+            epoch += 1
+
+    def featurize(self, audio, ref, tgt, rng):
+        label = self.vocab.encode(tgt)
+        if not label:
+            return None
+        wave = decode_audio(audio)
+        if self.train:
+            wave = augment(wave, self.cfg, rng)
+        if len(wave) > self.cfg.max_seconds * SR:
+            return None
+        return {"wave": wave, "label": label, "ref": self.vocab.encode(ref)}
+
+
+def load_dev(cfg, vocab, tts_units):
+    """Fixed dev list, unmodified: Iqra_train dev (native) + held-out TTS row groups."""
+    rng = np.random.default_rng(123)
+    out = []
+    for path in expand(cfg.native_dev):
+        rows = pq.read_table(path, columns=["audio", "phoneme_ref"]).to_pylist()
+        for k in rng.permutation(len(rows))[:cfg.n_dev_native]:
+            p = vocab.encode(rows[k]["phoneme_ref"])
+            out.append({"id": f"nat{k:05d}", "wave": decode_audio(rows[k]["audio"]), "ref": p, "label": p})
+    tts_rows = []
+    for path, rg, _ in tts_units:
+        tab = pq.ParquetFile(path).read_row_group(rg, columns=["audio", "phoneme_ref", "phoneme_mis", "label"])
+        tts_rows += tab.to_pylist()
+    for k in rng.permutation(len(tts_rows))[:cfg.n_dev_tts]:
+        r = tts_rows[k]
+        out.append({"id": f"tts{k:05d}", "wave": decode_audio(r["audio"]), "ref": vocab.encode(r["phoneme_ref"]),
+                    "label": vocab.encode(r["phoneme_mis"]), "tts_label": r["label"]})
+    return [x for x in out if x["label"] and len(x["wave"]) <= 60 * SR]
+
+
+def build(cfg, vocab):
+    """Training units (row groups) and the held-out TTS units."""
+    native = row_groups(expand(cfg.native_glob), "native", lambda f, rg: True)
+    tts_all = row_groups(expand(cfg.tts_glob), "tts", lambda f, rg: True)
+    tts_dev = [u for u in tts_all if is_tts_dev(u[0], u[1], cfg.tts_dev_every)]
+    tts_train = [u for u in tts_all if not is_tts_dev(u[0], u[1], cfg.tts_dev_every)]
+    return native + tts_train, tts_dev
+
+
+class Collator:
+    """Pads a batch with the encoder's own feature extractor (raw waveform for wav2vec2,
+    log-mel features for w2v-BERT)."""
+
+    def __init__(self, extractor):
+        self.fx = extractor
+
+    def __call__(self, items):
+        feats = self.fx([x["wave"] for x in items], sampling_rate=SR, return_tensors="pt", padding=True,
+                        return_attention_mask=True)
+        key = "input_values" if "input_values" in feats else "input_features"
+        L = max(len(x["label"]) for x in items)
+        R = max(max((len(x["ref"]) for x in items), default=0), 1)
+        labels = torch.full((len(items), L), -100, dtype=torch.long)
+        refs = torch.full((len(items), R), -100, dtype=torch.long)
+        for i, x in enumerate(items):
+            labels[i, :len(x["label"])] = torch.tensor(x["label"])
+            if x["ref"]:
+                refs[i, :len(x["ref"])] = torch.tensor(x["ref"])
+        return {"inputs": feats[key], "attention_mask": feats["attention_mask"], "labels": labels, "refs": refs}

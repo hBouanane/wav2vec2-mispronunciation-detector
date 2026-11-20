@@ -61,4 +61,5 @@ hf_model/
 *.pt
 results/*/aligned/
 runs/
-!v2/kaggle_train_v2.ipynb
+!kaggle_train.ipynb
+!kaggle_data.ipynb

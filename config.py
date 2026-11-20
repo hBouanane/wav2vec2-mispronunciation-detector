@@ -1,61 +1,53 @@
-from dataclasses import dataclass, asdict
+"""Training defaults. Every field is also a command-line flag of train.py
+(e.g. --encoder facebook/w2v-bert-2.0 --max-steps 20000)."""
+from dataclasses import asdict, dataclass
+
 
 @dataclass
 class Config:
-    # Data
-    dataset_name: str = "IqraEval/Iqra_train"
-    dataset_with_reference_name: str = "IqraEval/Iqra_TTS"
-    dataset_split: str = "dev"
+    # --- data: parquet files from the released IqraEval datasets (Kaggle input or HF cache)
+    native_glob: str = "/kaggle/input/*/iqra_train/data/train-*.parquet"
+    native_dev: str = "/kaggle/input/*/iqra_train/data/dev-*.parquet"
+    tts_glob: str = "/kaggle/input/*/iqra_tts/data/train-*.parquet"
     vocab_file: str = "sws_arabic.txt"
-    
-    # Model
-    pretrained_model: str = "elgeish/wav2vec2-large-xlsr-53-arabic"
-    freeze_encoder: bool = False
-    hidden_size: int = 1024
-    lstm_hidden_size: int = 512
-    num_transformer_layers: int = 2
-    
-    # Training
-    batch_size: int = 4
-    num_epochs: int = 25
-    learning_rate: float = 1e-4
-    warmup_steps: int = 100
-    warmup_ratio: float = 0.1
-    max_grad_norm: float = 1.0
+    tts_dev_every: int = 20          # every 20th TTS row group is held out for dev (~5%)
+    n_dev_native: int = 1500
+    n_dev_tts: int = 1500
+    max_seconds: float = 15.0
+    shuffle_pool: int = 16           # row groups (~100 rows each) mixed together per worker
+
+    # --- augmentation (training only)
+    speed_p: float = 0.5             # probability of speed perturbation
+    speed_range: float = 0.1         # factor in [1 - r, 1 + r]
+    noise_p: float = 0.3             # probability of added white noise
+    noise_snr_db: tuple = (10.0, 30.0)
+
+    # --- model
+    encoder: str = "elgeish/wav2vec2-large-xlsr-53-arabic"
+    mask_time_prob: float = 0.05
+    final_dropout: float = 0.1
+    grad_checkpointing: bool = True
+
+    # --- optimisation
+    batch_size: int = 8              # per GPU
+    grad_accum: int = 2
+    lr: float = 5e-5
+    head_lr_mult: float = 10.0       # the new output layer learns faster than the pretrained encoder
+    warmup: int = 1000
+    max_steps: int = 20000
     weight_decay: float = 0.01
-    
-    # Evaluation & Logging (HuggingFace Trainer style)
-    eval_strategy: str = "epoch"  # "no", "steps", "epoch"
-    eval_steps: int = 500  # Evaluate every N steps if eval_strategy="steps"
-    save_strategy: str = "epoch"  # "no", "steps", "epoch"
-    save_steps: int = 500  # Save every N steps if save_strategy="steps"
-    save_total_limit: int = 3  # Only keep last N checkpoints
-    logging_steps: int = 100  # Log every N steps
-    load_best_model_at_end: bool = True
-    metric_for_best_model: str = "wer"
-    greater_is_better: bool = False  # For WER, lower is better
-    
-    # Wandb
-    use_wandb: bool = True
-    wandb_project: str = "wav2vec2-mispronunciation"
-    wandb_run_name: str = "arabic-ctc-v1"
-    wandb_entity: str = None  # Your wandb username/team
-    
-    # Audio
-    sampling_rate: int = 16000
-    
-    # Paths
-    save_path: str = "./Wav2Vec2_mispronunciation_detector"
-    
-    # Data size
-    total_samples: int = None
-    train_size: int = None
-    
+    num_workers: int = 2
+    seed: int = 42
+
+    # --- reference penalty (phase 2, off by default): where the speaker said X but the reference
+    # has Y, add  w * -log(1 - p(Y))  on the frames aligned to X
+    ref_penalty: float = 0.0
+
+    # --- bookkeeping
+    eval_every: int = 1000
+    save_every: int = 1000
+    log_every: int = 50
+    time_limit_h: float = 11.3
+
     def to_dict(self):
         return asdict(self)
-
-# Usage example
-if __name__ == "__main__":
-    config = Config()
-    config_dict = config.to_dict()
-    print(config_dict)
