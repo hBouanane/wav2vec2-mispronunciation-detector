@@ -165,9 +165,18 @@ def build_train_stream(seed, p_native=0.55, buffer=500):
     return mixed.shuffle(seed=seed, buffer_size=buffer)
 
 
+VAL_VERSION = 2  # bump when the validation set changes, so "best F1" is reset on resume
+
+
 def build_val_sets(corrupter, n_native=1500, n_tts=1500, seed=123):
-    """Fixed validation lists (no test data): Iqra_train dev with deterministic reference
-    corruption on half of it, plus held-out TTS shard."""
+    """Fixed validation lists (no test data), built to resemble the test set (QuranMB.v2: errors
+    in 93% of utterances, ~7% of phonemes): EVERY utterance gets a deterministically corrupted
+    reference (2-12% of phones). Audio is always correct speech:
+      nat*  Iqra_train dev (native speakers)
+      tts*  Iqra_TTS shard 12, which holds only label=="original" (correct) recordings and is
+            never used for training.
+    v1 left half the native set and all of shard 12 error-free, so only ~1.6% of phonemes were
+    errors and precision was not comparable to the leaderboard."""
     rng = np.random.default_rng(seed)
     # data_files: only fetch the dev shard (split="dev" alone would download all 12 GB of train)
     nat = load_dataset("parquet", split="train",
@@ -177,14 +186,15 @@ def build_val_sets(corrupter, n_native=1500, n_tts=1500, seed=123):
     out = []
     for k, ex in enumerate(nat):
         spoken = clean(ex["phoneme_ref"])
-        ref = corrupter(spoken, rng) if k % 2 == 0 else spoken
+        ref = corrupter(spoken, rng)
         out.append({"id": f"nat{k:05d}", "audio": np.asarray(ex["audio"]["array"], dtype=np.float32), "ref": ref, "spoken": spoken})
     tts = load_dataset("parquet", split="train",
                        data_files=[f"hf://datasets/IqraEval/Iqra_TTS/{f}" for f in tts_files(False)])
     tts = tts.cast_column("audio", Audio(sampling_rate=SR)).shuffle(seed=seed).select(range(n_tts))
     for k, ex in enumerate(tts):
+        spoken = clean(ex["phoneme_mis"])  # == phoneme_ref for these "original" recordings
         out.append({"id": f"tts{k:05d}", "audio": np.asarray(ex["audio"]["array"], dtype=np.float32),
-                    "ref": clean(ex["phoneme_ref"]), "spoken": clean(ex["phoneme_mis"])})
+                    "ref": corrupter(spoken, rng), "spoken": spoken})
     return out
 
 

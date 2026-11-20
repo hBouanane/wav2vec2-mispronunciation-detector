@@ -23,8 +23,8 @@ from huggingface_hub import HfApi, snapshot_download
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from data_v2 import (Collator, Featurizer, PhoneVocab, RefCorrupter, build_train_stream,  # noqa: E402
-                     build_val_sets)
+from data_v2 import (VAL_VERSION, Collator, Featurizer, PhoneVocab, RefCorrupter,  # noqa: E402
+                     build_train_stream, build_val_sets)
 from mdd_metric import official_mdd  # noqa: E402
 from model_v2 import RefAnchoredMDD, decode  # noqa: E402
 
@@ -132,17 +132,25 @@ def evaluate(model, val, vocab, collate, acc, args, step):
                 out = model(b["wave"], b["wave_mask"], b["ref"])
             probs.append(({"slot_logits": out["slot_logits"].float().cpu(), "ins_logits": out["ins_logits"].float().cpu()},
                           b["ref"].cpu(), chunk))
-    results = {}
+    results, decoded = {}, {}
     for tau in TAUS:
         ids, refs, anns, preds = [], [], [], []
         for out, ref, chunk in probs:
             for (x, _), p in zip(chunk, decode(out, ref, vocab, tau=tau, tau_ins=0.5)):
                 ids.append(x["id"]); refs.append(x["ref"]); anns.append(x["spoken"]); preds.append(p)
+        decoded[tau] = (ids, refs, anns, preds)
         results[tau] = official_mdd(ids, refs, anns, preds, args.mdd_eval,
                                     workdir=os.path.join(args.out, "val_tmp"))
     model.train()
     best_tau = max(results, key=lambda t: results[t].get("f1", 0))
-    return best_tau, results
+    # same tau, scored separately on native speech and on TTS speech
+    subsets = {}
+    for name in ("nat", "tts"):
+        sel = [i for i, k in enumerate(decoded[best_tau][0]) if k.startswith(name)]
+        if sel:
+            subsets[name] = official_mdd(*[[col[i] for i in sel] for col in decoded[best_tau]], args.mdd_eval,
+                                         workdir=os.path.join(args.out, "val_tmp"))
+    return best_tau, results, subsets
 
 
 def main():
@@ -181,7 +189,7 @@ def main():
         return 0.0 if s < f else head_lr(s - f) if s - f < args.warmup else head_lr(s)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, [enc_lr, head_lr])  # stepped manually per optimizer step
 
-    state = {"step": 0, "best_f1": -1.0, "best_tau": 0.5}
+    state = {"step": 0, "best_f1": -1.0, "best_tau": 0.5, "val_version": VAL_VERSION}
     last_dir = os.path.join(args.out, "last")
     model, opt = acc.prepare(model, opt)
     hub = HubSync(args.hub_repo, args.out) if args.hub_repo and acc.is_main_process else None
@@ -191,8 +199,12 @@ def main():
     if (args.resume or args.hub_repo) and os.path.exists(os.path.join(last_dir, "train_state.json")):
         acc.load_state(last_dir)
         state = json.load(open(os.path.join(last_dir, "train_state.json")))
+        if state.get("val_version") != VAL_VERSION:  # old best F1 was on a different validation set
+            acc.print(f"validation set changed (v{state.get('val_version', 1)} -> v{VAL_VERSION}): resetting best F1")
+            state.update(best_f1=-1.0, best_tau=0.5)
         for _ in range(state["step"]):
             sched.step()
+        state["val_version"] = VAL_VERSION
         acc.print(f"resumed at step {state['step']}")
 
     wb = None
@@ -202,6 +214,8 @@ def main():
                         resume="allow", config=vars(args))
         state["wandb_id"] = wb.id
         wb.define_metric("val/*", step_metric="train/step")
+        wb.define_metric("val_nat/*", step_metric="train/step")
+        wb.define_metric("val_tts/*", step_metric="train/step")
         wb.define_metric("train/*", step_metric="train/step")
 
     # streaming data; reseed on resume so we don't replay the same order
@@ -263,18 +277,23 @@ def main():
                 if hub is not None and s % args.hub_every == 0:
                     hub.push(f"step {s}")
         if s % args.eval_every == 0 and acc.is_main_process:
-            tau, res = evaluate(unwrapped, val, vocab, collate, acc, args, s)
+            tau, res, sub = evaluate(unwrapped, val, vocab, collate, acc, args, s)
             f1 = res[tau].get("f1", 0)
             acc.print(f"[eval step {s}] " + " | ".join(f"tau {t}: F1 {r.get('f1', 0):.4f} P {r.get('precision', 0):.3f} "
                                                        f"R {r.get('recall', 0):.3f}" for t, r in res.items()), flush=True)
+            acc.print(f"  at tau {tau}: " + " | ".join(f"{k} F1 {r.get('f1', 0):.4f} P {r.get('precision', 0):.3f} "
+                                                      f"R {r.get('recall', 0):.3f}" for k, r in sub.items()), flush=True)
             if wb is not None:
                 row = {"train/step": s, "val/f1": f1, "val/best_tau": tau}
                 for t, r in res.items():
                     row.update({f"val/{k}@tau{t}": v for k, v in r.items()})
                 row.update({f"val/{k}": v for k, v in res[tau].items()})  # metrics at the best tau
+                for name, r in sub.items():
+                    row.update({f"val_{name}/{k}": v for k, v in r.items()})
                 wb.log(row)
             with open(os.path.join(args.out, "eval_log.jsonl"), "a") as f:
-                f.write(json.dumps({"step": s, "results": {str(k): v for k, v in res.items()}}) + "\n")
+                f.write(json.dumps({"step": s, "val_version": VAL_VERSION, "best_tau": tau, "subsets": sub,
+                                    "results": {str(k): v for k, v in res.items()}}) + "\n")
             if f1 > state["best_f1"]:
                 state.update(best_f1=f1, best_tau=tau)
                 if hub is not None:
