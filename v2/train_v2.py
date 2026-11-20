@@ -15,6 +15,7 @@ import time
 from datetime import timedelta
 
 import numpy as np
+import psutil
 import torch
 from accelerate import Accelerator, InitProcessGroupKwargs
 from datasets.distributed import split_dataset_by_node
@@ -53,12 +54,15 @@ def get_args():
     ap.add_argument("--corrupt-p", type=float, default=0.5, help="P(corrupt reference) for native audio")
     ap.add_argument("--max-seconds", type=float, default=15.0)
     ap.add_argument("--n-val", type=int, default=1500, help="validation utterances per subset")
-    ap.add_argument("--num-workers", type=int, default=3)
+    ap.add_argument("--num-workers", type=int, default=2,
+                    help="data workers per GPU; each holds ~2.5 GB RAM (Kaggle has ~30 GB in total)")
+    ap.add_argument("--shuffle-buffer", type=int, default=500,
+                    help="streaming shuffle buffer per worker; 2000 used ~3 GB RAM per worker and OOM-killed Kaggle")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--hub-repo", default=None,
                     help="private HF model repo (e.g. user/iqraeval-mdd-v2) for checkpoints; auto-resume from it")
-    ap.add_argument("--hub-every", type=int, default=2000, help="upload checkpoint to the Hub every N steps")
+    ap.add_argument("--hub-every", type=int, default=1000, help="upload checkpoint to the Hub every N steps")
     ap.add_argument("--wandb-project", default=None, help="log to this wandb project (needs WANDB_API_KEY)")
     ap.add_argument("--wandb-name", default=None, help="wandb run name; the run id is kept in the checkpoint "
                                                          "so resumed sessions continue the same run")
@@ -201,7 +205,7 @@ def main():
         wb.define_metric("train/*", step_metric="train/step")
 
     # streaming data; reseed on resume so we don't replay the same order
-    stream = build_train_stream(seed=args.seed + state["step"], p_native=args.p_native)
+    stream = build_train_stream(seed=args.seed + state["step"], p_native=args.p_native, buffer=args.shuffle_buffer)
     stream = split_dataset_by_node(stream, rank=acc.process_index, world_size=acc.num_processes)
     feat = Featurizer(vocab, corrupter, corrupt_p=args.corrupt_p, max_seconds=args.max_seconds,
                       seed=args.seed + state["step"] + 1000 * acc.process_index)
@@ -240,14 +244,16 @@ def main():
         log.append([out["loss"].item(), out["l_slot"].item(), out["l_ins"].item(), out["l_ctc"].item()])
         if s % args.log_every == 0:
             m = np.mean(log, 0); log = []
+            ram = psutil.virtual_memory()
+            ram_used, ram_total = (ram.total - ram.available) / 1e9, ram.total / 1e9
             if wb is not None:
                 lrs = sched.get_last_lr()
                 wb.log({"train/step": s, "train/loss": m[0], "train/loss_slot": m[1], "train/loss_ins": m[2],
                         "train/loss_ctc": m[3], "train/lr_head": lrs[1], "train/lr_encoder": lrs[0],
-                        "train/hours": (time.time() - t0) / 3600})
+                        "train/hours": (time.time() - t0) / 3600, "sys/ram_used_gb": ram_used})
             acc.print(f"step {s} loss {m[0]:.4f} slot {m[1]:.4f} ins {m[2]:.4f} ctc {m[3]:.4f} "
                       f"lr {sched.get_last_lr()[1]:.2e}/{sched.get_last_lr()[0]:.2e} {'(encoder frozen)' if frozen else ''} "
-                      f"{(time.time() - t0) / 60:.1f} min", flush=True)
+                      f"{(time.time() - t0) / 60:.1f} min | RAM {ram_used:.1f}/{ram_total:.0f} GB", flush=True)
         if s % args.save_every == 0:
             if hub is not None:
                 hub.wait()  # don't overwrite files an upload is still reading

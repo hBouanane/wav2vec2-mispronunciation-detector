@@ -155,7 +155,7 @@ def _std_native(ex):
     return {"audio": ex["audio"], "ref": ex["phoneme_ref"], "spoken": ex["phoneme_ref"], "native": True}
 
 
-def build_train_stream(seed, p_native=0.55, buffer=2000):
+def build_train_stream(seed, p_native=0.55, buffer=500):
     tts = load_dataset("IqraEval/Iqra_TTS", data_files=tts_files(True), split="train", streaming=True)
     nat = load_dataset("IqraEval/Iqra_train", split="train", streaming=True)
     tts = tts.cast_column("audio", Audio(sampling_rate=SR)).map(_std_tts, remove_columns=list(tts.column_names))
@@ -178,12 +178,12 @@ def build_val_sets(corrupter, n_native=1500, n_tts=1500, seed=123):
     for k, ex in enumerate(nat):
         spoken = clean(ex["phoneme_ref"])
         ref = corrupter(spoken, rng) if k % 2 == 0 else spoken
-        out.append({"id": f"nat{k:05d}", "audio": ex["audio"]["array"], "ref": ref, "spoken": spoken})
+        out.append({"id": f"nat{k:05d}", "audio": np.asarray(ex["audio"]["array"], dtype=np.float32), "ref": ref, "spoken": spoken})
     tts = load_dataset("parquet", split="train",
                        data_files=[f"hf://datasets/IqraEval/Iqra_TTS/{f}" for f in tts_files(False)])
     tts = tts.cast_column("audio", Audio(sampling_rate=SR)).shuffle(seed=seed).select(range(n_tts))
     for k, ex in enumerate(tts):
-        out.append({"id": f"tts{k:05d}", "audio": ex["audio"]["array"],
+        out.append({"id": f"tts{k:05d}", "audio": np.asarray(ex["audio"]["array"], dtype=np.float32),
                     "ref": clean(ex["phoneme_ref"]), "spoken": clean(ex["phoneme_mis"])})
     return out
 
