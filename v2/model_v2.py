@@ -8,7 +8,8 @@ a single class whose probability can be thresholded (precision/recall knob).
 
 Heads
   slot : per reference phone -> one of 68 phones or DEL
-  ins  : per gap (before first, between, after last) -> inserted phone or NONE
+  ins  : per gap (before first, between, after last) -> up to K inserted phones, in order,
+         terminated by NONE (NONE is the "stop / no more insertions" marker)
   ctc  : auxiliary free phoneme recognition on the audio (keeps the encoder grounded)
 """
 import torch
@@ -30,7 +31,7 @@ def sinusoid(n, d, device):
 class RefAnchoredMDD(nn.Module):
     def __init__(self, vocab, encoder_name="elgeish/wav2vec2-large-xlsr-53-arabic", d_model=512,
                  n_layers=4, n_heads=8, max_ref_len=512, dropout=0.1, ctc_weight=0.3,
-                 grad_checkpointing=True, encoder_config_only=False):
+                 grad_checkpointing=True, encoder_config_only=False, max_ins=3):
         super().__init__()
         self.v = vocab
         if encoder_config_only:  # for loading a fine-tuned checkpoint without downloading weights twice
@@ -38,6 +39,7 @@ class RefAnchoredMDD(nn.Module):
         else:
             self.encoder = Wav2Vec2Model.from_pretrained(encoder_name)
         self.encoder.config.mask_time_prob = 0.05  # SpecAugment-style masking while training
+        self.encoder.config.layerdrop = 0.0         # LayerDrop leaves params without grads -> DDP crash
         self.encoder.feature_extractor._freeze_parameters()
         if grad_checkpointing:
             self.encoder.gradient_checkpointing_enable()
@@ -50,7 +52,8 @@ class RefAnchoredMDD(nn.Module):
         layer = nn.TransformerDecoderLayer(d_model, n_heads, 4 * d_model, dropout, batch_first=True, norm_first=True)
         self.decoder = nn.TransformerDecoder(layer, n_layers, norm=nn.LayerNorm(d_model))
         self.slot_head = nn.Linear(d_model, vocab.n_phones + 1)
-        self.ins_head = nn.Linear(d_model, vocab.n_phones + 1)
+        self.max_ins = max_ins
+        self.ins_head = nn.Linear(d_model, max_ins * (vocab.n_phones + 1))
         self.ctc_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(H, vocab.n_phones + 1))
         self.ctc_weight = ctc_weight
 
@@ -65,12 +68,12 @@ class RefAnchoredMDD(nn.Module):
         tgt = self.ref_emb(ref) + self.ref_pos(torch.arange(S1, device=ref.device))[None]
         h = self.decoder(tgt, mem, tgt_key_padding_mask=ref.eq(self.v.PAD),
                          memory_key_padding_mask=~frame_mask)                         # [B, S+1, d]
-        out = {"slot_logits": self.slot_head(h[:, 1:]), "ins_logits": self.ins_head(h),
+        out = {"slot_logits": self.slot_head(h[:, 1:]), "ins_logits": self.ins_head(h).unflatten(-1, (self.max_ins, self.v.n_phones + 1)),  # [B,S+1,K,C]
                "ctc_logits": self.ctc_head(enc), "frame_len": frame_len}
 
         if slot is not None:
             l_slot = F.cross_entropy(out["slot_logits"].flatten(0, 1).float(), slot.flatten(), ignore_index=-100)
-            l_ins = F.cross_entropy(out["ins_logits"].flatten(0, 1).float(), ins.flatten(), ignore_index=-100)
+            l_ins = F.cross_entropy(out["ins_logits"].flatten(0, 2).float(), ins.flatten(), ignore_index=-100)
             logp = F.log_softmax(out["ctc_logits"].float(), -1).transpose(0, 1)
             tgt_len = (ctc >= 0).sum(-1)
             l_ctc = F.ctc_loss(logp, ctc.clamp_min(0), frame_len, tgt_len, blank=self.v.BLANK,
@@ -82,8 +85,9 @@ class RefAnchoredMDD(nn.Module):
 
 @torch.no_grad()
 def decode(out, ref, vocab, tau=0.5, tau_ins=0.5):
-    """Keep the reference phone unless its probability falls below tau; insert only if
-    P(NONE) falls below tau_ins. Returns list of predicted phone lists."""
+    """Keep the reference phone unless its probability falls below tau. In each gap, start
+    inserting only if P(NONE) at the first insertion position falls below tau_ins, then keep
+    taking the argmax until NONE (the stop marker) or K phones. Returns lists of phones."""
     p_slot = out["slot_logits"].float().softmax(-1)
     p_ins = out["ins_logits"].float().softmax(-1)
     preds = []
@@ -92,10 +96,15 @@ def decode(out, ref, vocab, tau=0.5, tau_ins=0.5):
         S = int((r != vocab.PAD).sum())
         seq = []
         for i in range(S + 1):
-            pi = p_ins[b, i]
-            if pi[vocab.NONE] < tau_ins:
-                q = pi.clone(); q[vocab.NONE] = -1
+            pi = p_ins[b, i]                                   # [K, C]
+            if pi[0, vocab.NONE] < tau_ins:
+                q = pi[0].clone(); q[vocab.NONE] = -1
                 seq.append(vocab.phones[int(q.argmax())])
+                for k in range(1, pi.shape[0]):
+                    c = int(pi[k].argmax())
+                    if c == vocab.NONE:
+                        break
+                    seq.append(vocab.phones[c])
             if i < S:
                 rid = int(r[i])
                 ps = p_slot[b, i]

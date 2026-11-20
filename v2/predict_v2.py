@@ -4,6 +4,7 @@ The decision threshold tau is read from <run>/best.json, i.e. chosen on the 2025
 validation data, never on the test set.
 
   python v2/predict_v2.py --run runs/run1 --out results/v2_run1 --fp16
+  python v2/predict_v2.py --hub-repo Haitam03/iqraeval-mdd-v2 --run runs/from_hub --out results/v2 --fp16
   python score_testset.py --pred results/v2_run1/predictions.csv --mdd-eval ../interspeech_IqraEval/mdd_eval
 """
 import argparse
@@ -26,12 +27,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True, help="training output dir with best_model.pt and best.json")
+    ap.add_argument("--hub-repo", default=None, help="download best_model.pt/best.json from this HF repo into --run")
     ap.add_argument("--out", required=True)
     ap.add_argument("--tau", type=float, default=None, help="override tau from best.json")
     ap.add_argument("--tau-ins", type=float, default=0.5)
     ap.add_argument("--fp16", action="store_true")
     a = ap.parse_args()
 
+    if a.hub_repo:
+        from huggingface_hub import snapshot_download
+        snapshot_download(a.hub_repo, local_dir=a.run, allow_patterns=["best_model.pt", "best.json"])
     best = json.load(open(os.path.join(a.run, "best.json")))
     targs = best["args"]
     tau = a.tau if a.tau is not None else best["best_tau"]

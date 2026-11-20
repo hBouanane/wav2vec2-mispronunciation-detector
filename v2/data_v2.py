@@ -8,10 +8,10 @@ Every training example is (audio, reference phonemes, spoken phonemes):
 
 From (reference, spoken) we derive per-slot labels by Levenshtein alignment:
   slot_labels[i]  what was said for reference phone i: a phone id, or DEL
-  ins_labels[j]   phone inserted after reference position j-1 (j=0: before the first), or NONE
+  ins_labels[j]   phones inserted after reference position j-1 (j=0: before the first):
+                  up to MAX_INS phones in spoken order, then NONE as the stop marker
 """
 import json
-import random
 from dataclasses import dataclass
 
 import numpy as np
@@ -19,6 +19,7 @@ import torch
 from datasets import Audio, interleave_datasets, load_dataset
 
 SR = 16000
+MAX_INS = 3  # insertions per gap; covers 99.99% of Iqra_TTS (1: 98.7%, 2: 99.88%)
 
 
 # ---------------------------------------------------------------- vocabulary
@@ -47,9 +48,10 @@ def clean(seq):
 
 
 # ---------------------------------------------------------------- alignment
-def align_labels(ref, spoken, DEL, NONE):
-    """Levenshtein-align ref -> spoken (lists of ids). Returns slot labels (len(ref))
-    and insertion labels (len(ref)+1). Ties prefer match/substitution."""
+def align_labels(ref, spoken, DEL, NONE, max_ins=MAX_INS):
+    """Levenshtein-align ref -> spoken (lists of ids). Returns slot labels (len(ref)) and
+    insertion labels (len(ref)+1 lists: inserted phones in order + NONE, at most max_ins
+    phones). Ties prefer match/substitution."""
     n, m = len(ref), len(spoken)
     D = np.zeros((n + 1, m + 1), dtype=np.int32)
     D[:, 0] = np.arange(n + 1)
@@ -59,7 +61,7 @@ def align_labels(ref, spoken, DEL, NONE):
         for j in range(1, m + 1):
             D[i, j] = min(D[i - 1, j - 1] + (ri != spoken[j - 1]), D[i - 1, j] + 1, D[i, j - 1] + 1)
     slot = [DEL] * n
-    ins = [NONE] * (n + 1)
+    ins = [[] for _ in range(n + 1)]
     i, j = n, m
     while i > 0 or j > 0:
         if i > 0 and j > 0 and D[i, j] == D[i - 1, j - 1] + (ref[i - 1] != spoken[j - 1]):
@@ -69,16 +71,19 @@ def align_labels(ref, spoken, DEL, NONE):
             slot[i - 1] = DEL
             i -= 1
         else:
-            ins[i] = spoken[j - 1]  # keeps the first inserted phone if several
+            ins[i].append(spoken[j - 1])  # collected right-to-left
             j -= 1
+    ins = [g[::-1][:max_ins] + ([NONE] if len(g) < max_ins else []) for g in ins]
     return slot, ins
 
 
 def labels_to_phones(ref_ids, slot_pred, ins_pred, vocab):
     out = []
     for i in range(len(ref_ids) + 1):
-        if ins_pred[i] != vocab.NONE:
-            out.append(vocab.phones[ins_pred[i]])
+        for c in ins_pred[i]:
+            if c == vocab.NONE:
+                break
+            out.append(vocab.phones[c])
         if i < len(ref_ids) and slot_pred[i] != vocab.DEL:
             out.append(vocab.phones[slot_pred[i]])
     return out
@@ -109,16 +114,16 @@ class RefCorrupter:
     def __call__(self, spoken, rng):
         rate = rng.uniform(*self.rate_range)
         ref = []
-        dropped = False  # never drop two in a row: the insertion head holds one phone per gap
+        dropped = 0  # at most MAX_INS drops in a row: the insertion head holds MAX_INS phones per gap
         for x in spoken:
             if rng.random() >= rate:
                 ref.append(x)
-                dropped = False
+                dropped = 0
                 continue
             kind = rng.choice(3, p=self.mix)
-            if kind == 2 and dropped:
+            if kind == 2 and dropped >= MAX_INS:
                 kind = 0
-            dropped = kind == 2
+            dropped = dropped + 1 if kind == 2 else 0
             if kind == 0 and x in self.rev:                    # speaker substituted: ref has Y
                 ys, p = self.rev[x]
                 ref.append(ys[rng.choice(len(ys), p=p)])
@@ -223,7 +228,7 @@ class Collator:
         wmask = torch.zeros(B, T, dtype=torch.long)
         ref = torch.full((B, S + 1), self.vocab.PAD, dtype=torch.long)   # +1 for BOS
         slot = torch.full((B, S), -100, dtype=torch.long)
-        ins = torch.full((B, S + 1), -100, dtype=torch.long)
+        ins = torch.full((B, S + 1, MAX_INS), -100, dtype=torch.long)
         ctc = torch.full((B, L), -100, dtype=torch.long)
         for b, x in enumerate(items):
             n, s = len(x["wave"]), len(x["ref"])
@@ -232,7 +237,8 @@ class Collator:
             ref[b, 0] = self.vocab.BOS
             ref[b, 1:s + 1] = torch.tensor(x["ref"])
             slot[b, :s] = torch.tensor(x["slot"])
-            ins[b, :s + 1] = torch.tensor(x["ins"])
+            for j, g in enumerate(x["ins"]):
+                ins[b, j, :len(g)] = torch.tensor(g)
             if x["ctc"]:
                 ctc[b, :len(x["ctc"])] = torch.tensor(x["ctc"])
         return {"wave": wave, "wave_mask": wmask, "ref": ref, "slot": slot, "ins": ins, "ctc": ctc}
