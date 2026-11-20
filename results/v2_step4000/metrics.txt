@@ -1,0 +1,16 @@
+Recall: 0.1441
+Precision: 0.3797
+f1-score: 0.2089
+True Acception: 0.9831 | 48970
+False Rejection: 0.0169 | 843
+False Acceptance: 0.8559 | 3065
+Correct Diagnosis: 0.5891 | 304
+Error Diagnosis: 0.4109 | 212
+False Acceptance Rate: 0.8559
+False Rejection Rate: 0.0169
+Diagnosis Error Rate: 0.4109
+Detection Accuracy: 0.9268
+
+
+PER (vs. human annotation): 0.0785
+Utterances scored: 1642/1642

@@ -268,14 +268,8 @@ def main():
             acc.print(f"step {s} loss {m[0]:.4f} slot {m[1]:.4f} ins {m[2]:.4f} ctc {m[3]:.4f} "
                       f"lr {sched.get_last_lr()[1]:.2e}/{sched.get_last_lr()[0]:.2e} {'(encoder frozen)' if frozen else ''} "
                       f"{(time.time() - t0) / 60:.1f} min | RAM {ram_used:.1f}/{ram_total:.0f} GB", flush=True)
-        if s % args.save_every == 0:
-            if hub is not None:
-                hub.wait()  # don't overwrite files an upload is still reading
-            acc.save_state(last_dir)
-            if acc.is_main_process:
-                json.dump(state, open(os.path.join(last_dir, "train_state.json"), "w"))
-                if hub is not None and s % args.hub_every == 0:
-                    hub.push(f"step {s}")
+        # evaluate BEFORE saving, so a checkpoint uploaded at this step already contains this step's
+        # best_model.pt / best.json / eval log (before, the upload lagged one eval behind)
         if s % args.eval_every == 0 and acc.is_main_process:
             tau, res, sub = evaluate(unwrapped, val, vocab, collate, acc, args, s)
             f1 = res[tau].get("f1", 0)
@@ -304,6 +298,14 @@ def main():
                 if wb is not None:
                     wb.summary.update({"best_val_f1": f1, "best_tau": tau, "best_step": s})
         acc.wait_for_everyone()
+        if s % args.save_every == 0:
+            if hub is not None:
+                hub.wait()  # don't overwrite files an upload is still reading
+            acc.save_state(last_dir)
+            if acc.is_main_process:
+                json.dump(state, open(os.path.join(last_dir, "train_state.json"), "w"))
+                if hub is not None and s % args.hub_every == 0:
+                    hub.push(f"step {s}")
 
     if hub is not None:
         hub.wait()
