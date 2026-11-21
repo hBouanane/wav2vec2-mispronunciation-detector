@@ -27,6 +27,7 @@ class Config:
     mask_time_prob: float = 0.05
     final_dropout: float = 0.1
     grad_checkpointing: bool = True
+    freeze_layers: int = 0           # freeze the first N transformer layers (e.g. 12 for w2v-BERT on a T4)
 
     # --- optimisation
     batch_size: int = 8              # per GPU

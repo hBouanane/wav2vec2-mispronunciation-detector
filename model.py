@@ -14,9 +14,39 @@ from utils import ctc_forced_align, greedy_ctc, substitutions
 
 CLASSES = {"wav2vec2": Wav2Vec2ForCTC, "wav2vec2-bert": Wav2Vec2BertForCTC}
 
+# Encoders published with a custom architecture whose encoder is a standard w2v-BERT 2.0:
+# we build Wav2Vec2BertForCTC from the base config and copy only the encoder weights.
+#   obadx/muaalem-model-v3_2: w2v-bert-2.0 fine-tuned on 850+ h of Quran recitation
+#   (Wav2Vec2BertForMultilevelCTC, MIT; arXiv:2509.00094). Its 22 head tensors
+#   (level_to_lm_head.*) are dropped; all 794 encoder tensors match by name and shape.
+W2VBERT_DERIVED = {"obadx/muaalem-model-v3_2": "facebook/w2v-bert-2.0"}
+
+
+def _load_derived_encoder(model, repo):
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    sd = {k: v for k, v in load_file(hf_hub_download(repo, "model.safetensors")).items()
+          if k.startswith("wav2vec2_bert.")}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    missing = [k for k in missing if not k.startswith("lm_head.") and k != "wav2vec2_bert.masked_spec_embed"]
+    if missing or unexpected:
+        raise RuntimeError(f"{repo}: encoder weights do not fit (missing {missing[:5]}, unexpected {unexpected[:5]})")
+    print(f"loaded {len(sd)} encoder tensors from {repo}")
+
+
+def freeze_lower_layers(model, n):
+    """Freeze the input projection and the first n transformer layers (saves optimizer memory)."""
+    base = getattr(model, "wav2vec2_bert", None) or getattr(model, "wav2vec2")
+    for p in base.feature_projection.parameters():
+        p.requires_grad_(False)
+    for layer in base.encoder.layers[:n]:
+        for p in layer.parameters():
+            p.requires_grad_(False)
+
 
 def build_model(cfg, vocab, pretrained=True):
-    enc_cfg = AutoConfig.from_pretrained(cfg.encoder)
+    base_name = W2VBERT_DERIVED.get(cfg.encoder, cfg.encoder)
+    enc_cfg = AutoConfig.from_pretrained(base_name)
     cls = CLASSES.get(enc_cfg.model_type)
     if cls is None:
         raise ValueError(f"unsupported encoder type {enc_cfg.model_type}")
@@ -25,15 +55,20 @@ def build_model(cfg, vocab, pretrained=True):
               mask_time_prob=cfg.mask_time_prob, final_dropout=cfg.final_dropout)
     if enc_cfg.model_type == "wav2vec2-bert":
         kw["add_adapter"] = True
-    if pretrained:
+    if pretrained and cfg.encoder in W2VBERT_DERIVED:
+        model = cls(AutoConfig.from_pretrained(base_name, **kw))
+        _load_derived_encoder(model, cfg.encoder)
+    elif pretrained:
         model = cls.from_pretrained(cfg.encoder, ignore_mismatched_sizes=True, **kw)
     else:  # architecture only (weights come from our own checkpoint)
-        model = cls(AutoConfig.from_pretrained(cfg.encoder, **kw))
+        model = cls(AutoConfig.from_pretrained(base_name, **kw))
     if hasattr(model, "freeze_feature_encoder"):
         model.freeze_feature_encoder()
+    if cfg.freeze_layers > 0:
+        freeze_lower_layers(model, cfg.freeze_layers)
     if cfg.grad_checkpointing:
         model.gradient_checkpointing_enable()
-    extractor = AutoFeatureExtractor.from_pretrained(cfg.encoder)
+    extractor = AutoFeatureExtractor.from_pretrained(base_name)  # muaalem uses the base preprocessing unchanged
     return model, extractor
 
 
