@@ -1,199 +1,141 @@
-# Wav2Vec2 Arabic Mispronunciation Detector
+# Arabic Mispronunciation Detection with Self-Supervised Speech Models
 
-> **Work in progress on this branch (`ctc`):** a plain CTC phoneme recogniser (audio only, no
-> reference input) trained on all released 2025 data — see `train.py`, `kaggle_train.ipynb`.
-> The model and results described below are **v1**; its code is at git tag
-> [`v1`](https://github.com/hBouanane/wav2vec2-mispronunciation-detector/tree/v1).
-> The reference-anchored experiment (test F1 0.27) is kept on branch `v2`.
+Detecting and diagnosing pronunciation errors in Arabic read speech (Modern Standard Arabic and Quranic verses) for the **[IqraEval](https://huggingface.co/IqraEval)** shared task. A speech model transcribes what the reader actually said at the phoneme level, and comparing that with the canonical phonemes of the text reveals every substituted, deleted or inserted sound.
 
-A reference-conditioned phoneme recogniser for **Modern Standard Arabic (MSA) mispronunciation detection and diagnosis (MDD)**, built for the [IqraEval](https://huggingface.co/IqraEval) shared task.
-
-The model listens to a learner reading a fully-vowelised sentence and outputs the phoneme sequence that was actually spoken. Comparing it with the canonical (reference) phonemes shows where the reader substituted, deleted or inserted a sound.
+> **Status: active research project.** The v1 model is released with a live demo. The current phase trains a new CTC recogniser on all of the released 2025 data. The goal is the **IqraEval.2 challenge (Interspeech 2026)**. See the [roadmap](#roadmap).
 
 | | |
 |---|---|
-| 🤗 **Model** | [`Haitam03/Wav2Vec2-mispronunciation-detector`](https://huggingface.co/Haitam03/Wav2Vec2-mispronunciation-detector) |
-| 🎙️ **Demo** | [`Haitam03/arabic-pronunciation-checker`](https://huggingface.co/spaces/Haitam03/arabic-pronunciation-checker) (Gradio Space) |
-| 🏁 **Benchmark** | [Iqra'Eval 2025 shared task (ArabicNLP 2025)](https://huggingface.co/spaces/IqraEval/SharedTask_ArabicNLP2025), test set `QuranMB.v2` |
+| 🤗 **Released model (v1)** | [`Haitam03/Wav2Vec2-mispronunciation-detector`](https://huggingface.co/Haitam03/Wav2Vec2-mispronunciation-detector) |
+| 🎙️ **Live demo** | [`Haitam03/arabic-pronunciation-checker`](https://huggingface.co/spaces/Haitam03/arabic-pronunciation-checker) (Gradio) |
+| 🏁 **Benchmarks** | [Iqra'Eval 2025 (ArabicNLP)](https://huggingface.co/spaces/IqraEval/SharedTask_ArabicNLP2025) · [IqraEval.2 (Interspeech 2026)](https://huggingface.co/spaces/IqraEval/IqraEval_Interspeech_26). Same test set: `QuranMB.v2`, 1,642 utterances |
 
 ```
 Reference : < y a t a H a d d a v u n n aa s u ...
 Predicted : < y a t a H a d d a s u n n aa s u ...
-                              ^ v → s  (substitution flagged)
+                              ^ v → s   substitution detected and diagnosed
 ```
 
----
+## Highlights
 
-## Results on the Iqra'Eval 2025 test set
+- **A released model and a public demo**, on Hugging Face Hub and Spaces.
+- **Rigorous, reproducible evaluation** with the challenge's official scoring scripts (hierarchical detection/diagnosis F1). The test set is used only for final checks, never for tuning.
+- **Diagnostic experiments, not just training.** Probes that test whether a model really listens or reconstructs the expected text, an analysis of why validation and test scores diverged, and decoding-time error checks. [Findings below](#what-the-experiments-taught-us).
+- **Training on free compute.** 2-GPU data-parallel training on Kaggle (2× T4) with 🤗 Accelerate and mixed precision. Checkpoints go to a private Hugging Face repo, and interrupted sessions resume automatically. Experiments are tracked in Weights & Biases.
+- **An efficient data pipeline.** About 18 GB of parquet audio is read directly, without a dataset cache. Shuffling covers all ~1,300 row groups every epoch, with on-the-fly resampling and speed and noise augmentation.
 
-This model was **not submitted** to the challenge. The numbers below come from running it on the test set after the organisers released the ground truth (`IqraEval/IqraEval_Test_GT`). The scoring uses the [official MDD scripts](https://github.com/Iqra-Eval/interspeech_IqraEval/tree/main/mdd_eval) (see [Reproducing](#reproducing-the-test-set-results)). The comparison rows come from the [ArabicNLP 2025 leaderboard](https://huggingface.co/spaces/IqraEval/Leaderboard_ArabicNLP25).
+## Results so far
 
-Test set: `IqraEval/QuranMB.v2` (published in 2025 as `IqraEval/open_testset`) · 1,642 utterances (98 verses × 18 speakers, ≈ 2 h) · human-annotated mispronunciations.
+Test set `QuranMB.v2` (98 verses × 18 speakers, human-annotated). Official MDD scoring. F1 is the challenge's ranking metric.
 
-| System | F1 ↑ | Precision | Recall | Correct Rate | Accuracy | TA | FR | FA | CD |
-|---|---|---|---|---|---|---|---|---|---|
-| Baic (1st) | 0.4726 | 0.3713 | 0.6501 | 0.8985 | 0.8701 | 0.9209 | 0.0791 | 0.3499 | 0.6873 |
-| Hafs2Vec (2nd) | 0.4650 | 0.3292 | 0.7920 | 0.8655 | 0.8488 | 0.8840 | 0.1160 | 0.2080 | 0.6252 |
-| Ghalib (3rd) | 0.4477 | 0.3218 | 0.7353 | 0.8667 | 0.8506 | 0.8886 | 0.1114 | 0.2647 | 0.5925 |
-| Official baseline 1 | 0.4414 | 0.3093 | 0.7707 | 0.8361 | 0.8234 | 0.8763 | 0.1237 | 0.2293 | 0.6120 |
-| Metapseud | 0.4236 | 0.2879 | 0.8012 | 0.8397 | 0.8213 | 0.8575 | 0.1425 | 0.1988 | 0.6030 |
-| **This model** (`best_mode_full_data.pt`) | **0.4190** | **0.3003** | **0.6928** | **0.8621** | **0.7966** | **0.8839** | **0.1161** | **0.3072** | **0.6187** |
-| Official baseline 2 | 0.4042 | 0.2715 | 0.7908 | 0.8093 | 0.7955 | 0.8474 | 0.1526 | 0.2092 | 0.5847 |
+| System | F1 ↑ | Precision | Recall | Notes |
+|---|---|---|---|---|
+| *2025 leaderboard: 1st place (Baic)* | *0.473* | *0.371* | *0.650* | ArabicNLP 2025 |
+| *2025 official HuBERT baseline* | *0.441* | *0.309* | *0.771* | |
+| **v1: reference-conditioned wav2vec2 (released)** | **0.419** | 0.300 | 0.693 | would have placed 6th of 12 teams; not submitted |
+| v1 + reference-checked decoding | 0.404 | 0.344 | 0.487 | fewer false alarms, but more missed errors |
+| v2: reference-anchored decoder (step 8k) | 0.268 | 0.413 | 0.199 | mostly copies the reference on real speech |
+| **v3: CTC recogniser on all 2025 data** | *training* | | | current phase |
+| *2026 leaderboard: 1st place* | *0.720* | *0.742* | *0.700* | uses 2026 data incl. real learner errors |
 
-Read as a leaderboard entry, the model would have placed **6th of 12 teams**. Its F1 is just below the official HuBERT baseline. Its correct rate and true-acceptance rate are among the higher ones on the board, which means it rarely flags correctly-read phonemes. It misses more real errors (recall 0.69) than most systems, because it was trained only on synthetic TTS errors and has never heard a real learner mistake.
+Full v1 metrics: [`results/best_mode_full_data/metrics.txt`](results/best_mode_full_data/metrics.txt).
 
-Phoneme error rate against the human annotation is **0.203**: 5,038 substitutions, 2,269 deletions and 3,358 insertions over 52,432 phonemes. Many of the insertions are split geminates (`n n` for `nn`), a clear target for improvement.
+## What the experiments taught us
 
-TA/FR = true acceptance / false rejection (correct phonemes), FA = false acceptance (missed errors), CD = correct diagnosis. Full output: [`results/best_mode_full_data/metrics.txt`](results/best_mode_full_data/metrics.txt). Challenge-format predictions: [`submission.csv`](results/best_mode_full_data/submission.csv).
+1. **Feeding the reference into the model makes it predict the reference.** In v1, a probe that swapped in another sentence's reference doubled the error rate. But v1 never reproduced that wrong text, and its phoneme error rate (0.21) was three times worse than simply copying the correct reference (0.07). The reference added noise rather than useful information.
+2. **The training distribution matters more than the architecture.** v1 trained only on TTS speech with injected errors, where 1 phoneme in 5 is wrong. The real test has about 1 in 15. The model learned to over-flag, which produced 5,781 false rejections.
+3. **Synthetic errors can teach a text shortcut.** v2 created training errors by editing the *reference text*. It learned to spot unusual-looking references instead of listening: validation F1 was 0.57, but the real test F1 was only 0.27. Lesson: train and validate only on unmodified released data.
+4. **Decoding cannot fix the acoustic model.** Accepting a detected error only when the CTC likelihood clearly favours it cut false alarms by 40%. But v1 is about as unsure of its true detections as of its false alarms, so F1 still dropped.
 
----
+These results shaped v3: a plain recogniser that only hears the audio, trained on the data exactly as released.
 
-## How it works
-
-The task gives the model the **reference phonemes** as well as the audio, so it does not have to recognise speech from scratch. It needs to find where the reader departed from the text. The architecture exploits this with cross-attention from audio frames to the reference:
+## Current approach (v3)
 
 ```
- audio (16 kHz)                         reference phonemes
-      │                                         │
- Wav2Vec2-large-XLSR-53 (Arabic)         Embedding (1024)
-      │                                         │
-  LayerNorm                              BiLSTM (2×512)
-      │                                         │
-      └──────────► Multi-head cross-attention ◄─┘
-                   (query = audio, key/value = phonemes, 8 heads)
-                              │
-                  residual + LayerNorm
-                              │
-                Linear 1024→1024 + ReLU + Dropout(0.1)
-                              │
-                      BiLSTM (2×512)
-                              │
-                   Linear → 71 phoneme logits
-                              │
-                     CTC (greedy decoding)
+audio 16 kHz ──► self-supervised encoder ──► linear ──► CTC over 68 phonemes ──► greedy transcript
+                 (wav2vec2 / w2v-BERT 2.0)                                              │
+reference phonemes ───────────────────────────────────────────────────► official MDD alignment
+                                                                         → error detection and diagnosis
 ```
 
-| Component | Detail |
-|---|---|
-| Acoustic encoder | [`elgeish/wav2vec2-large-xlsr-53-arabic`](https://huggingface.co/elgeish/wav2vec2-large-xlsr-53-arabic), CNN feature extractor frozen, transformer fine-tuned |
-| Phoneme set | 68 IqraEval MSA phonemes ([`sws_arabic.txt`](sws_arabic.txt)) + `[UNK]`, `[PAD]`, `[BLANK]` = 71 tokens. Gemination is a separate symbol (`b` vs `bb`) |
-| Loss | CTC, `[PAD]` used as blank |
-| Parameters | ~330 M (all trainable except the CNN front-end) |
+- **Encoders:**
+  - [`elgeish/wav2vec2-large-xlsr-53-arabic`](https://huggingface.co/elgeish/wav2vec2-large-xlsr-53-arabic) (315M);
+  - [`facebook/w2v-bert-2.0`](https://huggingface.co/facebook/w2v-bert-2.0) (606M);
+  - [`obadx/muaalem-model-v3_2`](https://huggingface.co/obadx/muaalem-model-v3_2): w2v-BERT 2.0 fine-tuned on 850+ h of Quran recitation ([arXiv:2509.00094](https://huggingface.co/papers/2509.00094)). Its encoder loads into the standard architecture with a new 68-phoneme output layer.
+- **Data:** the released 2025 data, unmodified:
+  - `Iqra_train`: 79 h of native read speech. The target is the canonical phonemes.
+  - `Iqra_TTS`: synthetic speech, correct and with injected errors. The target is the realised phonemes.
+- **Dev set:** `Iqra_train` dev plus held-out `Iqra_TTS` row groups. The best checkpoint is chosen by dev phoneme error rate.
+- **Reference penalty (optional):** an unlikelihood term `−log(1 − p(reference phoneme))` on the frames force-aligned to each substituted phoneme. It directly penalises "hearing" the expected phoneme when a different one was spoken.
 
-## Training data
+## Roadmap
 
-Trained on [`IqraEval/Iqra_TTS`](https://huggingface.co/datasets/IqraEval/Iqra_TTS), a synthetic corpus in which errors were injected into the text before TTS generation. Each example provides:
+- [x] **v1:** released model and demo, evaluated on the 2025 test set (F1 0.419)
+- [x] Analysis of reference reliance, validation vs. test, and decoding-time checks ([findings](#what-the-experiments-taught-us))
+- [x] Scalable training: parquet pipeline, 2-GPU training, Hub checkpointing, wandb
+- [ ] **v3:** CTC recogniser on all 2025 data, comparing encoders (xlsr-53 Arabic, w2v-BERT 2.0, Quran-pretrained muaalem)
+- [ ] Reference penalty fine-tuning: a lower false-acceptance rate without more false rejections
+- [ ] Checkpoint averaging and encoder ensembling
+- [ ] **IqraEval.2 (Interspeech 2026):** add the 2026 real-mispronunciation data (`Iqra_Extra_IS26`) and compare with the 2026 leaderboard
 
-- `phoneme_ref`: canonical phonemes of the correct sentence → **model input**
-- `phoneme_aug`: phonemes of what was actually synthesised (with errors) → **CTC target**
+Comparisons stay fair: results with 2025 data only are reported against the 2025 board. Results using 2026 data or encoders published after the 2025 challenge (e.g. muaalem, August 2025) are reported separately.
 
-The training split is shuffled with seed 42 and split 80/20 into train and validation.
-
-| Hyper-parameter | Value |
-|---|---|
-| Optimiser | AdamW, lr 1e-4, weight decay 0.01 |
-| Schedule | linear with 10 % warm-up |
-| Batch size | 4 |
-| Epochs | 25 (best checkpoint by validation PER) |
-| Grad clipping | 1.0 |
-| Framework | 🤗 Transformers + Accelerate |
-
-## Installation
+## Quick start
 
 ```bash
 git clone https://github.com/hBouanane/wav2vec2-mispronunciation-detector.git
 cd wav2vec2-mispronunciation-detector
 pip install -r requirements.txt
+git clone https://github.com/Iqra-Eval/interspeech_IqraEval ../interspeech_IqraEval   # official scoring
 ```
 
-## Usage
+**Train on Kaggle (free, 2× T4):**
+1. Run [`kaggle_data.ipynb`](kaggle_data.ipynb) once. It downloads the released parquet files (~18 GB) as notebook output.
+2. Attach that output to [`kaggle_train.ipynb`](kaggle_train.ipynb) and run it. It resumes from the Hub automatically.
 
-### Inference on your own audio
+Every field in [`config.py`](config.py) is also a command-line flag, e.g. `--encoder obadx/muaalem-model-v3_2 --freeze-layers 12 --ref-penalty 0.5`.
 
-Download the released weights and set the paths in [`inference.py`](inference.py):
-
+**Local sanity check** (tiny random encoder, a few cached files):
 ```bash
-huggingface-cli download Haitam03/Wav2Vec2-mispronunciation-detector \
-    best_mode_full_data.pt --local-dir hf_model
+python train.py --smoke --out runs/smoke --mdd-eval ../interspeech_IqraEval/mdd_eval
 ```
 
-```python
-from inference import predict_phonemes
-pred = predict_phonemes(model, processor, "recording.wav",
-                        reference_phonemes="< a l H a m d u l i ll a h i")
-```
-
-Reference phonemes for new text can be produced with the official [MSA phonetiser](https://github.com/Iqra-Eval/MSA_phonetiser). It needs fully diacritised input.
-
-### Training
-
+**Score on the test set** (the ground truth is gated: accept its terms on Hugging Face, then `huggingface-cli login`):
 ```bash
-wandb login        # optional, set use_wandb=False in config.py to disable
-python train.py
+python predict_testset.py --run runs/myrun --out results/myrun
+python score_testset.py --pred results/myrun/predictions.csv --mdd-eval ../interspeech_IqraEval/mdd_eval
 ```
 
-All hyper-parameters are in [`config.py`](config.py). Set `total_samples` / `train_size` to train on a streamed subset.
-
-### Validation
-
-```bash
-python evaluate_model.py   # PER on the held-out 20 % of Iqra_TTS
-```
-
-## Reproducing the test-set results
-
-```bash
-# 1. official scoring scripts
-git clone https://github.com/Iqra-Eval/interspeech_IqraEval ../interspeech_IqraEval
-
-# 2. ground truth is gated: accept the terms on the dataset page, then
-huggingface-cli login
-
-# 3. predict (≈15 min on a 4 GB GPU with --fp16)
-python predict_testset.py --checkpoint hf_model/best_mode_full_data.pt \
-    --out results/best_mode_full_data --fp16
-
-# 4. score
-python score_testset.py --pred results/best_mode_full_data/predictions.csv \
-    --mdd-eval ../interspeech_IqraEval/mdd_eval
-```
-
-`predict_testset.py` writes `predictions.csv` (`ID,Prediction`, for scoring) and `submission.csv` (`ID,Labels`, the challenge submission format). `score_testset.py` writes `metrics.txt` next to them.
-
-## Released checkpoints
-
-| File | Architecture | Notes |
-|---|---|---|
-| `best_mode_full_data.pt` | BiLSTM + cross-attention (this repo) | **Final model**, used by the demo Space and for the results above |
-| `best_model.pt` | Transformer phoneme encoder + 2 cross-attention blocks | Earlier version, not compatible with current `model.py` |
-| `epoch_2_full_data.pt` | – | Intermediate training checkpoint (includes optimiser state) |
-
-## Project structure
+## Repository
 
 ```
-├── config.py            # all hyper-parameters
-├── model.py             # Wav2Vec2MispronunciationDetector
-├── data.py              # dataset loading, preprocessing, CTC collator
-├── train.py             # training loop (Accelerate + wandb)
-├── evaluate_model.py    # validation PER
-├── inference.py         # single-file inference
-├── predict_testset.py   # IqraEval.2 test-set predictions
-├── score_testset.py     # official MDD metrics + PER
-├── utils.py             # vocab / processor helpers
-├── sws_arabic.txt       # IqraEval phoneme inventory
-└── results/             # test-set predictions and metrics
+├── config.py            training defaults (all exposed as CLI flags)
+├── data.py              parquet reader, row-group shuffling, resampling, augmentation
+├── model.py             CTC model builder (wav2vec2 / w2v-BERT / muaalem), decoding, reference penalty
+├── train.py             multi-GPU training: dev evaluation, Hub checkpoints, wandb
+├── utils.py             phoneme vocabulary, CTC forced alignment, edit alignment
+├── predict_testset.py   transcribe the QuranMB.v2 test set
+├── score_testset.py     official MDD metrics + PER
+├── mdd_metric.py        wrapper around the official scoring scripts
+├── kaggle_data.ipynb    one-time data download on Kaggle
+├── kaggle_train.ipynb   training notebook
+└── results/             test-set predictions and metrics
 ```
+
+Earlier versions are kept in git:
+- `v1` (tag): the released reference-conditioned model and its training code.
+- `v2` (branch): the reference-anchored decoder experiment.
 
 ## Acknowledgements
 
-- [IqraEval](https://huggingface.co/IqraEval) organisers for the datasets, phoneme set and evaluation scripts
-- [elgeish/wav2vec2-large-xlsr-53-arabic](https://huggingface.co/elgeish/wav2vec2-large-xlsr-53-arabic) for the pre-trained encoder
+- The [IqraEval](https://huggingface.co/IqraEval) organisers, for the datasets, the phoneme inventory and the evaluation scripts.
+- [elgeish/wav2vec2-large-xlsr-53-arabic](https://huggingface.co/elgeish/wav2vec2-large-xlsr-53-arabic), [facebook/w2v-bert-2.0](https://huggingface.co/facebook/w2v-bert-2.0) and [obadx/muaalem-model-v3_2](https://huggingface.co/obadx/muaalem-model-v3_2) (Abdelfattah et al., 2025) for the pretrained encoders.
 
 ## Citation
 
 ```bibtex
-@software{bouanane2025wav2vec2mdd,
-  title  = {Wav2Vec2 Arabic Mispronunciation Detector},
+@software{bouanane2025arabicmdd,
+  title  = {Arabic Mispronunciation Detection with Self-Supervised Speech Models},
   author = {Bouanane, Haitam},
   year   = {2025},
   url    = {https://github.com/hBouanane/wav2vec2-mispronunciation-detector}
