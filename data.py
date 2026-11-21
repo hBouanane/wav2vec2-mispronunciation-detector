@@ -12,6 +12,7 @@ groups at a time, so a batch mixes random files, speakers and both datasets.
 import glob
 import io
 import math
+import os
 import zlib
 
 import numpy as np
@@ -27,10 +28,16 @@ COLUMNS = {"native": ("audio", "phoneme_ref", "phoneme_ref"),   # audio, referen
 
 
 def expand(pattern):
-    files = sorted(glob.glob(pattern))
+    """Glob with ** support (Kaggle mounts notebook outputs at varying depths under /kaggle/input)."""
+    files = sorted(glob.glob(pattern, recursive=True))
     if not files:
-        raise FileNotFoundError(f"no parquet files match {pattern}")
-    return files
+        root = pattern.split("*")[0] or "."
+        found = sorted(glob.glob(os.path.join(root, "**", "*.parquet"), recursive=True))[:10]
+        raise FileNotFoundError(f"no parquet files match {pattern}; parquet files under {root}: {found or 'none'}")
+    unique = {}
+    for f in files:  # the same data attached twice must not be read twice
+        unique.setdefault(os.path.basename(f), f)
+    return sorted(unique.values())
 
 
 def decode_audio(audio):

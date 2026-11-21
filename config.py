@@ -6,9 +6,9 @@ from dataclasses import asdict, dataclass
 @dataclass
 class Config:
     # --- data: parquet files from the released IqraEval datasets (Kaggle input or HF cache)
-    native_glob: str = "/kaggle/input/*/iqra_train/data/train-*.parquet"
-    native_dev: str = "/kaggle/input/*/iqra_train/data/dev-*.parquet"
-    tts_glob: str = "/kaggle/input/*/iqra_tts/data/train-*.parquet"
+    native_glob: str = "/kaggle/input/**/iqra_train/data/train-*.parquet"
+    native_dev: str = "/kaggle/input/**/iqra_train/data/dev-*.parquet"
+    tts_glob: str = "/kaggle/input/**/iqra_tts/data/train-*.parquet"
     vocab_file: str = "sws_arabic.txt"
     tts_dev_every: int = 20          # every 20th TTS row group is held out for dev (~5%)
     n_dev_native: int = 1500
