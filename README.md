@@ -144,4 +144,4 @@ Earlier versions are kept in git:
 
 ## License
 
-MIT
+[MIT](LICENSE)
