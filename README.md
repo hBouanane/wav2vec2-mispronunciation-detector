@@ -67,6 +67,7 @@ reference phonemes ────────────────────�
   - `Iqra_train`: 79 h of native read speech. The target is the canonical phonemes.
   - `Iqra_TTS`: synthetic speech, correct and with injected errors. The target is the realised phonemes.
 - **Dev set:** `Iqra_train` dev plus held-out `Iqra_TTS` row groups. The best checkpoint is chosen by dev phoneme error rate.
+- **muaalem with its own heads (`--target qps`):** instead of a new output layer, keep muaalem's pretrained phoneme and tafkheem heads. IqraEval labels are converted into its Quran Phonetic Script for training: consonants map one-to-one, gemination becomes a doubled letter, emphatic vowels become tafkheem labels, and a pause mark separates distinct identical consonants. Native labels survive the round trip exactly in 99.3% of utterances. The output is converted back to IqraEval phonemes.
 - **Reference penalty (optional):** an unlikelihood term `−log(1 − p(reference phoneme))` on the frames force-aligned to each substituted phoneme. It directly penalises "hearing" the expected phoneme when a different one was spoken.
 
 ## Roadmap

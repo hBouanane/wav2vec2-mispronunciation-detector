@@ -53,7 +53,7 @@ def main():
         b = to_device(collate([{"wave": ex["audio"]["array"], "label": [0], "ref": []}]), dev)
         with torch.no_grad(), torch.autocast(dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
             logits = model(b["inputs"], attention_mask=b["attention_mask"]).logits
-        rows.append({"ID": ex["ID"], "Prediction": " ".join(greedy_decode(logits, frame_lengths(model, b["attention_mask"]), vocab)[0])})
+        rows.append({"ID": ex["ID"], "Prediction": " ".join(greedy_decode(logits, frame_lengths(model, b["attention_mask"]), vocab, model)[0])})
 
     os.makedirs(a.out, exist_ok=True)
     df = pd.DataFrame(rows)

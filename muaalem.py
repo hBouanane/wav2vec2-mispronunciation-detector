@@ -108,3 +108,65 @@ def to_iqraeval(qps, tafkheem=None, emphasis="head_no_raa"):
                 out.pop()
             out.append((v * 2).upper() if heavy else v * 2)
     return out
+
+
+# ------------------------------------------------------------------ IqraEval phonemes -> QPS targets
+HEAVY, LIGHT = "[مفخم]", "[مرقق]"
+SAKT = "ۜ"   # pause mark; used as a separator between two separate identical consonants
+TAFKHEEM_LETTERS = set("خصضغطقظ")                     # quran-transcript phonetic_groups.tafkheem
+TO_LETTER = {"<": "ء", "n": "ن", "m": "م"}             # primary letter for IqraEval symbols with several QPS forms
+TO_LETTER.update({v: k for k, v in CONSONANT.items() if v not in TO_LETTER})
+TO_SHORT = {"a": "َ", "u": "ُ", "i": "ِ"}
+TO_MADD = {"a": "ا", "u": "ۥ", "i": "ۦ"}
+
+
+def from_iqraeval(phones):
+    """IqraEval phones -> (QPS string, one tafkheem label per QPS group), the training targets for
+    muaalem's phoneme and tafkheem heads. Inverse of to_iqraeval(..., emphasis="head"):
+      consonant X / geminate XX  -> letter / doubled letter (one group)
+      short vowel a u i          -> fatha damma kasra on the preceding consonant group
+      long vowel aa uu ii        -> short vowel + two madd symbols (اا / ۥۥ / ۦۦ, its own group)
+      emphatic vowel (A, AA, ..) -> the group(s) carrying it are labelled mofakham
+      separate identical consonants (IqraEval "m m", not the geminate "mm") -> the sakt mark ۜ
+          between them, so QPS keeps them as two groups (a run of one letter is a single group)
+    A consonant group without a vowel is mofakham iff its letter is a tafkheem letter."""
+    qps, taf, open_group = [], [], False   # open_group: last group is a consonant still without vowel
+    for p in phones:
+        base = p[0]
+        if base in TO_LETTER and (len(p) == 1 or p == base * 2):          # consonant or geminate
+            letter = TO_LETTER[base]
+            if open_group and qps and qps[-1][-1] == letter:
+                qps.append(SAKT)
+            qps.append(letter * len(p))
+            taf.append(HEAVY if letter in TAFKHEEM_LETTERS else LIGHT)
+            open_group = True
+        elif base.lower() in TO_SHORT:                                     # vowel (short or long)
+            v, heavy, long_ = base.lower(), base.isupper(), len(p) == 2
+            if open_group:
+                qps.append(TO_SHORT[v])
+                taf[-1] = HEAVY if heavy else LIGHT
+            open_group = False
+            if long_:
+                qps.append(TO_MADD[v] * 2)
+                taf.append(HEAVY if heavy else LIGHT)
+        # anything else (none expected in the 68-symbol set) is skipped
+    # Known limit: a vowel with no consonant group before it (e.g. an injected extra vowel right
+    # after another vowel) cannot be written in QPS and is dropped: 0.03% of Iqra_train dev
+    # phonemes, 0.8% of Iqra_TTS phoneme_mis phonemes.
+    return "".join(qps), taf
+
+
+class QPSVocab:
+    """muaalem's token ids for the phoneme and tafkheem levels (blank / [PAD] = 0)."""
+
+    def __init__(self, repo=REPO):
+        v = json.load(open(hf_hub_download(repo, "vocab.json"), encoding="utf-8"))
+        self.tok2id = {lvl: v[lvl] for lvl in ("phonemes", "tafkheem_or_taqeeq")}
+        self.id2tok = {lvl: {i: t for t, i in d.items()} for lvl, d in self.tok2id.items()}
+        self.size = {lvl: len(d) for lvl, d in self.tok2id.items()}
+
+    def encode(self, phones):
+        """IqraEval phone list -> (phoneme ids, tafkheem ids) training targets."""
+        qps, taf = from_iqraeval(phones)
+        return ([self.tok2id["phonemes"][c] for c in qps if c in self.tok2id["phonemes"]],
+                [self.tok2id["tafkheem_or_taqeeq"][t] for t in taf])

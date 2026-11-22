@@ -95,8 +95,11 @@ def smoke_setup(a, cfg):
     t0 = get("IqraEval/Iqra_TTS", "train-00000-of-00013.parquet")
     get("IqraEval/Iqra_TTS", "train-00012-of-00013.parquet")
     cfg.tts_glob = os.path.join(os.path.dirname(t0), "train-000*-of-00013.parquet")
-    cfg.encoder = "hf-internal-testing/tiny-random-wav2vec2"
-    cfg.grad_checkpointing = False
+    if cfg.target == "qps":   # real muaalem (no tiny version exists); freeze most of it to fit small GPUs
+        cfg.encoder, cfg.freeze_layers, cfg.grad_checkpointing = "obadx/muaalem-model-v3_2", 22, True
+    else:
+        cfg.encoder = "hf-internal-testing/tiny-random-wav2vec2"
+        cfg.grad_checkpointing = False
     cfg.max_steps, cfg.eval_every, cfg.save_every, cfg.log_every = 6, 6, 3, 2
     cfg.batch_size, cfg.grad_accum, cfg.warmup, cfg.num_workers = 2, 1, 2, 0
     cfg.n_dev_native, cfg.n_dev_tts, cfg.shuffle_pool = 6, 6, 2
@@ -113,7 +116,7 @@ def evaluate(model, dev, collate, vocab, acc, a):
         b = to_device(collate([dev[i] for i in idx]), acc.device)
         with acc.autocast():
             logits = model(b["inputs"], attention_mask=b["attention_mask"]).logits
-        for i, p in zip(idx, greedy_decode(logits, frame_lengths(model, b["attention_mask"]), vocab)):
+        for i, p in zip(idx, greedy_decode(logits, frame_lengths(model, b["attention_mask"]), vocab, model)):
             preds[i] = p
     model.train()
     res = {}
@@ -143,10 +146,13 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(cfg.seed)
     vocab = Vocab(cfg.vocab_file)
+    if cfg.target == "qps" and cfg.ref_penalty > 0:
+        raise ValueError("--ref-penalty is only implemented for the IqraEval CTC head (target iqraeval)")
 
     model, extractor = build_model(cfg, vocab)
-    head = [p for n, p in model.named_parameters() if n.startswith("lm_head") and p.requires_grad]
-    body = [p for n, p in model.named_parameters() if not n.startswith("lm_head") and p.requires_grad]
+    is_head = lambda n: n.startswith(("lm_head", "level_to_lm_head"))
+    head = [p for n, p in model.named_parameters() if is_head(n) and p.requires_grad]
+    body = [p for n, p in model.named_parameters() if not is_head(n) and p.requires_grad]
     opt = torch.optim.AdamW([{"params": body, "lr": cfg.lr}, {"params": head, "lr": cfg.lr * cfg.head_lr_mult}],
                             weight_decay=cfg.weight_decay)
 
@@ -199,7 +205,9 @@ def main():
             break
         batch = to_device(batch, acc.device)
         with acc.accumulate(model):
-            out = model(batch["inputs"], attention_mask=batch["attention_mask"], labels=batch["labels"])
+            labels = ({"phonemes": batch["qps"], "tafkheem_or_taqeeq": batch["tafk"]} if cfg.target == "qps"
+                      else batch["labels"])
+            out = model(batch["inputs"], attention_mask=batch["attention_mask"], labels=labels)
             loss, pen, n_subs = out.loss, torch.zeros((), device=acc.device), 0
             if cfg.ref_penalty > 0:
                 pen, n_subs = reference_penalty(out.logits, frame_lengths(model, batch["attention_mask"]),

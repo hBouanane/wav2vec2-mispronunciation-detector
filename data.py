@@ -84,6 +84,10 @@ class RowGroupShuffle(IterableDataset):
     def __init__(self, units, vocab, cfg, rank=0, world=1, seed=0, train=True):
         self.units, self.vocab, self.cfg = units, vocab, cfg
         self.rank, self.world, self.seed, self.train = rank, world, seed, train
+        self.qps = None
+        if cfg.target == "qps":  # targets for muaalem's own phoneme + tafkheem heads
+            from muaalem import QPSVocab
+            self.qps = QPSVocab()
 
     def __iter__(self):
         info = get_worker_info()
@@ -122,7 +126,12 @@ class RowGroupShuffle(IterableDataset):
             wave = augment(wave, self.cfg, rng)
         if len(wave) > self.cfg.max_seconds * SR:
             return None
-        return {"wave": wave, "label": label, "ref": self.vocab.encode(ref)}
+        ex = {"wave": wave, "label": label, "ref": self.vocab.encode(ref)}
+        if self.qps is not None:
+            ex["qps"], ex["tafk"] = self.qps.encode(self.vocab.decode(label))
+            if not ex["qps"]:
+                return None
+        return ex
 
 
 def load_dev(cfg, vocab, tts_units):
@@ -173,4 +182,11 @@ class Collator:
             labels[i, :len(x["label"])] = torch.tensor(x["label"])
             if x["ref"]:
                 refs[i, :len(x["ref"])] = torch.tensor(x["ref"])
-        return {"inputs": feats[key], "attention_mask": feats["attention_mask"], "labels": labels, "refs": refs}
+        batch = {"inputs": feats[key], "attention_mask": feats["attention_mask"], "labels": labels, "refs": refs}
+        for k in ("qps", "tafk"):  # muaalem targets (target == "qps")
+            if all(k in x for x in items):
+                t = torch.full((len(items), max(max(len(x[k]) for x in items), 1)), -100, dtype=torch.long)
+                for i, x in enumerate(items):
+                    t[i, :len(x[k])] = torch.tensor(x[k])
+                batch[k] = t
+        return batch

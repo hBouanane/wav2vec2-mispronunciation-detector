@@ -5,10 +5,16 @@ mispronunciations are found afterwards by comparing the output with the referenc
 Supported encoders (chosen by their config's model_type):
   wav2vec2       e.g. elgeish/wav2vec2-large-xlsr-53-arabic, facebook/wav2vec2-xls-r-300m
   wav2vec2-bert  e.g. facebook/w2v-bert-2.0
+
+With --target qps the Quran-pretrained muaalem model keeps its own phoneme and tafkheem heads
+(MuaalemCTC); IqraEval labels are converted to its Quran Phonetic Script for training.
 """
+from types import SimpleNamespace
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from transformers import (AutoConfig, AutoFeatureExtractor, Wav2Vec2BertForCTC, Wav2Vec2ForCTC)
+from transformers import (AutoConfig, AutoFeatureExtractor, Wav2Vec2BertForCTC, Wav2Vec2BertModel, Wav2Vec2ForCTC)
 
 from utils import ctc_forced_align, greedy_ctc, substitutions
 
@@ -44,7 +50,67 @@ def freeze_lower_layers(model, n):
             p.requires_grad_(False)
 
 
+class MuaalemCTC(nn.Module):
+    """muaalem's encoder + its own `phonemes` (Quran Phonetic Script) and `tafkheem_or_taqeeq`
+    heads, both initialised from the pretrained model and trained with CTC on IqraEval labels
+    converted by muaalem.from_iqraeval. Output -> IqraEval phonemes via muaalem.to_iqraeval.
+    Parameter names follow the original checkpoint (wav2vec2_bert.*, level_to_lm_head.*)."""
+
+    LEVELS = ("phonemes", "tafkheem_or_taqeeq")
+
+    def __init__(self, cfg, pretrained=True):
+        super().__init__()
+        from muaalem import QPSVocab
+        self.qps = QPSVocab()
+        enc_cfg = AutoConfig.from_pretrained("facebook/w2v-bert-2.0", add_adapter=True, layerdrop=0.0,
+                                             mask_time_prob=cfg.mask_time_prob,
+                                             apply_spec_augment=cfg.mask_time_prob > 0)
+        self.wav2vec2_bert = Wav2Vec2BertModel(enc_cfg)
+        self.dropout = nn.Dropout(cfg.final_dropout)
+        self.level_to_lm_head = nn.ModuleDict({lvl: nn.Linear(enc_cfg.hidden_size, self.qps.size[lvl])
+                                               for lvl in self.LEVELS})
+        self.weights = {"phonemes": 1.0, "tafkheem_or_taqeeq": cfg.tafkheem_weight}
+        if pretrained:
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file
+            sd = load_file(hf_hub_download("obadx/muaalem-model-v3_2", "model.safetensors"))
+            sd = {k: v for k, v in sd.items() if k.startswith("wav2vec2_bert.")
+                  or any(k.startswith(f"level_to_lm_head.{lvl}.") for lvl in self.LEVELS)}
+            missing, unexpected = self.load_state_dict(sd, strict=False)
+            if unexpected or set(missing) - {"wav2vec2_bert.masked_spec_embed"}:
+                raise RuntimeError(f"muaalem weights do not fit: missing {missing[:5]}, unexpected {unexpected[:5]}")
+            print(f"loaded {len(sd)} muaalem tensors (encoder + {', '.join(self.LEVELS)} heads)")
+
+    def gradient_checkpointing_enable(self):
+        self.wav2vec2_bert.gradient_checkpointing_enable()
+
+    def _get_feat_extract_output_lengths(self, input_lengths):
+        return self.wav2vec2_bert._get_feat_extract_output_lengths(input_lengths)
+
+    def forward(self, input_features, attention_mask=None, labels=None):
+        h = self.dropout(self.wav2vec2_bert(input_features, attention_mask=attention_mask).last_hidden_state)
+        logits = {lvl: head(h) for lvl, head in self.level_to_lm_head.items()}
+        loss = None
+        if labels is not None:
+            lengths = self._get_feat_extract_output_lengths(attention_mask.sum(-1)).long()
+            loss = 0.0
+            for lvl, y in labels.items():
+                logp = F.log_softmax(logits[lvl].float(), -1).transpose(0, 1)
+                loss = loss + self.weights[lvl] * F.ctc_loss(
+                    logp, y.clamp_min(0), lengths, (y >= 0).sum(-1), blank=0, reduction="mean", zero_infinity=True)
+        return SimpleNamespace(loss=loss, logits=logits)
+
+
 def build_model(cfg, vocab, pretrained=True):
+    if cfg.target == "qps":
+        if cfg.encoder != "obadx/muaalem-model-v3_2":
+            raise ValueError("--target qps needs --encoder obadx/muaalem-model-v3_2")
+        model = MuaalemCTC(cfg, pretrained)
+        if cfg.freeze_layers > 0:
+            freeze_lower_layers(model, cfg.freeze_layers)
+        if cfg.grad_checkpointing:
+            model.gradient_checkpointing_enable()
+        return model, AutoFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
     base_name = W2VBERT_DERIVED.get(cfg.encoder, cfg.encoder)
     enc_cfg = AutoConfig.from_pretrained(base_name)
     cls = CLASSES.get(enc_cfg.model_type)
@@ -78,7 +144,21 @@ def frame_lengths(model, attention_mask):
 
 
 @torch.no_grad()
-def greedy_decode(logits, lengths, vocab):
+def greedy_decode(logits, lengths, vocab, model=None):
+    """-> list of IqraEval phone lists. `logits` is a tensor (IqraEval CTC head) or, for
+    MuaalemCTC, a dict of level -> logits decoded in Quran Phonetic Script and converted."""
+    if isinstance(logits, dict):
+        from muaalem import to_iqraeval
+        m = model.module if hasattr(model, "module") else model
+        ph = logits["phonemes"].argmax(-1).cpu().numpy()
+        tf = logits["tafkheem_or_taqeeq"].argmax(-1).cpu().numpy()
+        out = []
+        for b in range(len(ph)):
+            L = int(lengths[b])
+            qps = "".join(m.qps.id2tok["phonemes"][i] for i in greedy_ctc(ph[b], L, 0))
+            taf = [m.qps.id2tok["tafkheem_or_taqeeq"][i] for i in greedy_ctc(tf[b], L, 0)]
+            out.append(to_iqraeval(qps, taf, emphasis="head"))
+        return out
     ids = logits.argmax(-1).cpu().numpy()
     return [vocab.decode(greedy_ctc(ids[b], int(lengths[b]), vocab.blank)) for b in range(len(ids))]
 

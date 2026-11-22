@@ -28,6 +28,8 @@ class Config:
     final_dropout: float = 0.1
     grad_checkpointing: bool = True
     freeze_layers: int = 0           # freeze the first N transformer layers (e.g. 12 for w2v-BERT on a T4)
+    target: str = "iqraeval"         # "qps": keep muaalem's phoneme + tafkheem heads (needs the muaalem encoder)
+    tafkheem_weight: float = 0.3     # weight of the tafkheem CTC loss when target == "qps"
 
     # --- optimisation
     batch_size: int = 8              # per GPU
