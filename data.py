@@ -105,9 +105,13 @@ class RowGroupShuffle(IterableDataset):
                     if path not in handles:
                         handles[path] = pq.ParquetFile(path)
                     a, r, t = COLUMNS[kind]
-                    tab = handles[path].read_row_group(rg, columns=list(dict.fromkeys([a, r, t])))
+                    keep_label = self.cfg.tts_labels if kind == "tts" and self.cfg.tts_labels != "all" else None
+                    cols = list(dict.fromkeys([a, r, t] + (["label"] if keep_label else [])))
+                    tab = handles[path].read_row_group(rg, columns=cols)
                     name = path.replace("\\", "/").split("/")[-1]
                     for row in tab.to_pylist():
+                        if keep_label and row["label"] != keep_label:
+                            continue  # e.g. --tts-labels original: skip clips with injected errors
                         pool.append((row[a], row[r], row[t], f"{kind}:{name}:{rg}"))
                 rng.shuffle(pool)
                 for audio, ref, tgt, src in pool:

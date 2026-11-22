@@ -15,6 +15,9 @@ class Config:
     n_dev_tts: int = 1500
     max_seconds: float = 15.0
     shuffle_pool: int = 16           # row groups (~100 rows each) mixed together per worker
+    # which Iqra_TTS clips to train on: "all", "original" (correctly read verses only, no injected
+    # errors) or "augmented". The dev set is unaffected (it always holds both kinds).
+    tts_labels: str = "all"
 
     # --- augmentation (training only)
     speed_p: float = 0.5             # probability of speed perturbation
