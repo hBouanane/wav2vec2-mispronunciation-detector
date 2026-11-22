@@ -70,9 +70,24 @@ class HubSync:
         if self.future is not None:
             try:
                 self.future.result()
+                self.prune()
             except Exception as e:
                 print(f"[hub] upload failed: {e}", flush=True)
             self.future = None
+
+    def prune(self):
+        """Permanently delete LFS files no longer referenced by the latest commit. Squashing the
+        history alone does not free storage: every old checkpoint keeps counting toward the
+        account's private storage limit (a 20k-step run had left ~49 GB of dead checkpoints)."""
+        try:
+            info = self.api.model_info(self.repo, files_metadata=True)
+            keep = {s.lfs.sha256 for s in info.siblings if s.lfs}
+            old = [f for f in self.api.list_lfs_files(self.repo) if f.file_oid not in keep]
+            if old:
+                self.api.permanently_delete_lfs_files(self.repo, old)
+                print(f"[hub] freed {sum(f.size for f in old) / 1e9:.1f} GB of old checkpoints", flush=True)
+        except Exception as e:
+            print(f"[hub] prune skipped: {e}", flush=True)
 
     def push(self, msg, block=False):
         self.wait()
