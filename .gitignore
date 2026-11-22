@@ -63,3 +63,5 @@ results/*/aligned/
 runs/
 !kaggle_train.ipynb
 !kaggle_data.ipynb
+results/*/tmp/
+results/*/*.pkl

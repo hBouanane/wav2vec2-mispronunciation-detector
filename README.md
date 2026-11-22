@@ -35,7 +35,8 @@ Test set `QuranMB.v2` (98 verses × 18 speakers, human-annotated). Official MDD 
 | **v1: reference-conditioned wav2vec2 (released)** | **0.419** | 0.300 | 0.693 | would have placed 6th of 12 teams; not submitted |
 | v1 + reference-checked decoding | 0.404 | 0.344 | 0.487 | fewer false alarms, but more missed errors |
 | v2: reference-anchored decoder (step 8k) | 0.268 | 0.413 | 0.199 | mostly copies the reference on real speech |
-| **v3: CTC recogniser on all 2025 data** | *training* | | | current phase |
+| **v3: CTC recogniser, xlsr-53 Arabic (step 5k of 20k)** | **0.423** | 0.289 | 0.793 | training in progress; highest recall so far |
+| muaalem zero-shot (Quran-pretrained, no IqraEval training) | 0.355 | 0.231 | 0.768 | output converted to IqraEval phonemes; encoder published after the 2025 challenge |
 | *2026 leaderboard: 1st place* | *0.720* | *0.742* | *0.700* | uses 2026 data incl. real learner errors |
 
 Full v1 metrics: [`results/best_mode_full_data/metrics.txt`](results/best_mode_full_data/metrics.txt).
