@@ -45,6 +45,9 @@ class Config:
     # --- reference penalty (phase 2, off by default): where the speaker said X but the reference
     # has Y, add  w * -log(1 - p(Y))  on the frames aligned to X
     ref_penalty: float = 0.0
+    # start from trained weights (fresh optimizer / schedule / step count), e.g. for the penalty
+    # fine-tune: a local best_model.pt or a Hub repo id holding best_model.pt. Empty = pretrained encoder.
+    init_from: str = ""
 
     # --- bookkeeping
     eval_every: int = 1000

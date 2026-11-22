@@ -150,6 +150,14 @@ def main():
         raise ValueError("--ref-penalty is only implemented for the IqraEval CTC head (target iqraeval)")
 
     model, extractor = build_model(cfg, vocab)
+    if cfg.init_from:
+        path = cfg.init_from
+        if not os.path.exists(path):  # Hub repo id
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(cfg.init_from, "best_model.pt")
+        sd = torch.load(path, map_location="cpu")
+        model.load_state_dict({k.removeprefix("module."): v for k, v in sd.items()})
+        print(f"initialised weights from {cfg.init_from}")
     is_head = lambda n: n.startswith(("lm_head", "level_to_lm_head"))
     head = [p for n, p in model.named_parameters() if is_head(n) and p.requires_grad]
     body = [p for n, p in model.named_parameters() if not is_head(n) and p.requires_grad]
