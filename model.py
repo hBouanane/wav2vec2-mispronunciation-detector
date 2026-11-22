@@ -118,7 +118,10 @@ def build_model(cfg, vocab, pretrained=True):
         raise ValueError(f"unsupported encoder type {enc_cfg.model_type}")
     kw = dict(vocab_size=vocab.size, pad_token_id=vocab.blank, ctc_loss_reduction="mean", ctc_zero_infinity=True,
               layerdrop=0.0,  # LayerDrop leaves parameters without gradients -> DDP crash
-              mask_time_prob=cfg.mask_time_prob, final_dropout=cfg.final_dropout)
+              mask_time_prob=cfg.mask_time_prob, final_dropout=cfg.final_dropout,
+              # w2v-bert-2.0 ships with apply_spec_augment=False: with mask_time_prob > 0 the model would
+              # create masked_spec_embed but never use it, and DDP stops on the unused parameter
+              apply_spec_augment=cfg.mask_time_prob > 0)
     if enc_cfg.model_type == "wav2vec2-bert":
         kw["add_adapter"] = True
     if pretrained and cfg.encoder in W2VBERT_DERIVED:
