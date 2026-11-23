@@ -1,9 +1,9 @@
 """Run a trained CTC model once and save its frame log-probabilities, for analyses that
 need many decodings (decoding bias sweeps, training-data noise checks).
 
-  python dump_logits.py --run runs/ctc_step9000 --set dev        # held-out TTS + Iqra_train dev
-  python dump_logits.py --run runs/ctc_step9000 --set test       # QuranMB.v2 + released labels
-  python dump_logits.py --run runs/ctc_step9000 --set tts_train  # sample of TTS TRAINING rows
+  python dump_logits.py --run runs/myrun --set dev        # held-out TTS + Iqra_train dev
+  python dump_logits.py --run runs/myrun --set test       # QuranMB.v2 + released labels
+  python dump_logits.py --run runs/myrun --set tts_train  # sample of TTS TRAINING rows
 
 Output: results/logits_<run>/<set>.pkl  (list of dicts: id, ref, label, logp[T,V] fp16, ...)
 Uses locally cached TTS shards 0 (augmented) and 12 (original); held-out row groups follow

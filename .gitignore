@@ -59,9 +59,8 @@ wandb/
 # Downloaded checkpoints / eval scratch
 hf_model/
 *.pt
-results/*/aligned/
 runs/
 !kaggle_train.ipynb
 !kaggle_data.ipynb
-results/*/tmp/
-results/*/*.pkl
+# run outputs (predictions, metrics, logits) live outside git / on the Hub
+results/
