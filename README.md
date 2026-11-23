@@ -2,11 +2,12 @@
 
 Detecting and diagnosing pronunciation errors in Arabic read speech (Modern Standard Arabic and Quranic verses) for the **[IqraEval](https://huggingface.co/IqraEval)** shared task. A speech model transcribes what the reader actually said at the phoneme level, and comparing that with the canonical phonemes of the text reveals every substituted, deleted or inserted sound.
 
-> **Status: active research project.** The v1 model is released with a live demo. The best model so far, a w2v-BERT 2.0 CTC recogniser trained only on 2025 data, reaches **F1 0.459** on the 2025 test set (official baseline 0.441). The goal is the **IqraEval.2 challenge (Interspeech 2026)**. See the [roadmap](#roadmap).
+> **Status: active research project.** The v1 model is released with a live demo. The best model so far, a w2v-BERT 2.0 CTC recogniser trained only on 2025 data, reaches **F1 0.460** on the 2025 test set (official baseline 0.441) and is [published on Hugging Face](https://huggingface.co/Haitam03/iqraeval-w2vbert2-ctc). The goal is the **IqraEval.2 challenge (Interspeech 2026)**. See the [roadmap](#roadmap).
 
 | | |
 |---|---|
-| 🤗 **Released model (v1)** | [`Haitam03/Wav2Vec2-mispronunciation-detector`](https://huggingface.co/Haitam03/Wav2Vec2-mispronunciation-detector) |
+| 🤗 **Best model (v3)** | [`Haitam03/iqraeval-w2vbert2-ctc`](https://huggingface.co/Haitam03/iqraeval-w2vbert2-ctc): w2v-BERT 2.0 CTC, F1 0.460 |
+| 🤗 **First model (v1)** | [`Haitam03/Wav2Vec2-mispronunciation-detector`](https://huggingface.co/Haitam03/Wav2Vec2-mispronunciation-detector) |
 | 🎙️ **Live demo** | [`Haitam03/arabic-pronunciation-checker`](https://huggingface.co/spaces/Haitam03/arabic-pronunciation-checker) (Gradio) |
 | 🏁 **Benchmarks** | [Iqra'Eval 2025 (ArabicNLP)](https://huggingface.co/spaces/IqraEval/SharedTask_ArabicNLP2025) · [IqraEval.2 (Interspeech 2026)](https://huggingface.co/spaces/IqraEval/IqraEval_Interspeech_26). Same test set: `QuranMB.v2`, 1,642 utterances |
 
@@ -36,7 +37,7 @@ Test set `QuranMB.v2` (98 verses × 18 speakers, human-annotated). Official MDD 
 | v1 + reference-checked decoding | 0.404 | 0.344 | 0.487 | fewer false alarms, but more missed errors |
 | v2: reference-anchored decoder (step 8k) | 0.268 | 0.413 | 0.199 | mostly copies the reference on real speech |
 | v3: CTC recogniser, xlsr-53 Arabic | 0.43 | 0.29 | 0.80 | 0.429–0.432 across checkpoints 9k–11k; highest recall |
-| **v3: CTC recogniser, w2v-BERT 2.0, correct TTS clips only** | **0.459** | **0.335** | 0.729 | best result with 2025 data only; would have placed 3rd of 12 teams |
+| **v3: CTC recogniser, w2v-BERT 2.0, correct TTS clips only** ([model](https://huggingface.co/Haitam03/iqraeval-w2vbert2-ctc)) | **0.460** | **0.336** | 0.729 | best result with 2025 data only; would have placed 3rd of 12 teams |
 | muaalem zero-shot (Quran-pretrained, no IqraEval training) | 0.355 | 0.231 | 0.768 | output converted to IqraEval phonemes |
 | muaalem fine-tuned with its own heads (`--target qps`) | 0.455 | 0.324 | 0.764 | separate category: encoder published after the 2025 challenge |
 | *2026 leaderboard: 1st place* | *0.720* | *0.742* | *0.700* | uses 2026 data incl. real learner errors |
@@ -84,7 +85,7 @@ reference phonemes ────────────────────�
 - [x] **v1:** released model and demo, evaluated on the 2025 test set (F1 0.419)
 - [x] Analysis of reference reliance, validation vs. test, and decoding-time checks ([findings](#what-the-experiments-taught-us))
 - [x] Scalable training: parquet pipeline, 2-GPU training, Hub checkpointing, wandb
-- [x] **v3:** CTC recogniser on all 2025 data, comparing encoders: xlsr-53 Arabic (0.43), w2v-BERT 2.0 (**0.459**), Quran-pretrained muaalem (0.455)
+- [x] **v3:** CTC recogniser on all 2025 data, comparing encoders: xlsr-53 Arabic (0.43), w2v-BERT 2.0 (**0.460**, published), Quran-pretrained muaalem (0.455)
 - [x] TTS label-noise analysis; training without injected-error clips
 - [x] Reference penalty fine-tuning (did not help on this test set)
 - [ ] Model ensembling (averaging phoneme probabilities of w2v-BERT and xlsr)
